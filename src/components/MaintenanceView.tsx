@@ -1,6 +1,7 @@
 import React from "react";
 import { Settings, Sparkles, Clock, ShieldAlert } from "lucide-react";
 import { motion } from "motion/react";
+import { LogoIcon } from "./LogoIcon";
 
 export default function MaintenanceView() {
   const currentYear = new Date().getFullYear();
@@ -39,9 +40,7 @@ export default function MaintenanceView() {
       {/* Top Header Branding */}
       <header className="w-full max-w-5xl mx-auto flex items-center justify-between relative z-10 shrink-0">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-blue-600/15 rounded-xl border border-blue-500/30">
-            <Sparkles className="h-5 w-5 text-blue-400" />
-          </div>
+          <LogoIcon className="h-7 w-7" />
           <span className="font-sans font-extrabold text-sm tracking-widest text-white uppercase">Life OS</span>
         </div>
         <div className="flex items-center gap-2 px-3 py-1 bg-red-500/10 border border-red-500/20 rounded-full text-[10px] font-bold text-red-400 uppercase tracking-wider">

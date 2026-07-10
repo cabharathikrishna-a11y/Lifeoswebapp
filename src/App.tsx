@@ -14,6 +14,8 @@ import { motion, AnimatePresence } from "motion/react";
 import { 
   initAuth, 
   googleSignIn, 
+  googleSignInRedirect,
+  handleRedirectResult,
   googleSignOut, 
   listenToAllUsers, 
   listenToMyBell, 
@@ -36,6 +38,7 @@ import { User } from "firebase/auth";
 
 // View components
 import LoginView from "./components/LoginView.tsx";
+import { LogoIcon } from "./components/LogoIcon.tsx";
 import TaskView from "./components/TaskView.tsx";
 import TimerView from "./components/TimerView.tsx";
 import HabitsView from "./components/HabitsView.tsx";
@@ -531,6 +534,21 @@ export default function App() {
     const chats = localStorage.getItem("life_os_chats");
     if (chats) setChatMessages(safeParse(chats, []));
 
+    // Check redirect result on load to catch login return
+    const checkRedirect = async () => {
+      try {
+        const result = await handleRedirectResult();
+        if (result) {
+          setCurrentUser(result.user);
+          setAccessToken(result.accessToken);
+        }
+      } catch (err: any) {
+        console.error("Redirect login recovery failed:", err);
+        setLoginError(err?.code || err?.message || String(err));
+      }
+    };
+    checkRedirect();
+
     // Initialize Firebase Auth subscription
     const unsubscribeAuth = initAuth(
       (user, token) => {
@@ -721,18 +739,23 @@ export default function App() {
     setBellSignal(null);
   };
 
-  const handleLogin = async () => {
+  const handleLogin = async (useRedirect: any = false, withWorkspaceScopes: boolean = true) => {
+    const isRedirect = useRedirect === true;
     setIsLoggingIn(true);
     setLoginError(null);
     try {
-      const result = await googleSignIn();
+      if (isRedirect) {
+        await googleSignInRedirect(withWorkspaceScopes);
+        return; // Page redirects, nothing more to do in current lifecycle
+      }
+      const result = await googleSignIn(withWorkspaceScopes);
       if (result) {
         setCurrentUser(result.user);
         setAccessToken(result.accessToken);
       }
     } catch (e: any) {
       console.error("Google login failed:", e);
-      setLoginError(e?.message || String(e));
+      setLoginError(e?.code || e?.message || String(e));
     } finally {
       setIsLoggingIn(false);
     }
@@ -1017,7 +1040,7 @@ export default function App() {
           {/* Brand identity header */}
           <div className="h-16 flex items-center justify-between px-6 border-b border-gray-800/60 shrink-0">
             <div className="flex items-center gap-2.5">
-              <Sparkles className="h-5 w-5 text-blue-400" />
+              <LogoIcon className="h-5 w-5" />
               <span className="font-sans font-bold text-base tracking-tight text-white uppercase">Life OS</span>
             </div>
             <button 

@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect
+    x="24"
+    y="24"
+    width="464"
+    height="464"
+    rx="128"
+    fill="#04060d"
+    stroke="#1e3a8a"
+    stroke-width="28"
+    stroke-linejoin="round"
+  />
+  <rect
+    x="38"
+    y="38"
+    width="436"
+    height="436"
+    rx="114"
+    fill="none"
+    stroke="#3b82f6"
+    stroke-width="6"
+    stroke-opacity="0.8"
+  />
+  <text
+    x="256"
+    y="235"
+    font-family="'Inter', 'Arial Rounded MT Bold', 'Outfit', 'Segoe UI', system-ui, sans-serif"
+    font-weight="900"
+    font-size="145"
+    fill="#3b82f6"
+    text-anchor="middle"
+    letter-spacing="-2"
+  >
+    LIFE
+  </text>
+  <text
+    x="256"
+    y="370"
+    font-family="'Inter', 'Arial Rounded MT Bold', 'Outfit', 'Segoe UI', system-ui, sans-serif"
+    font-weight="900"
+    font-size="145"
+    fill="#3b82f6"
+    text-anchor="middle"
+    letter-spacing="-2"
+  >
+    OS
+  </text>
+</svg>

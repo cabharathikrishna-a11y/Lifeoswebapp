@@ -14,6 +14,8 @@ import { FocusRecord } from "../types.ts";
 import { 
   getAuth, 
   signInWithPopup, 
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider, 
   onAuthStateChanged, 
   signOut,
@@ -75,20 +77,19 @@ export const logFirebaseEvent = (eventName: string, eventParams?: Record<string,
 
 // Initialize App Check for local debugging and reCAPTCHA Enterprise
 if (typeof window !== "undefined") {
-  (window as any).FIREBASE_APPCHECK_DEBUG_TOKEN = true;
+  (window as any).FIREBASE_APPCHECK_DEBUG_TOKEN = "C3E6F273-8953-4466-AA23-C274E4D6F598";
 }
 
 export let appCheck: any = null;
 if (typeof window !== "undefined") {
   try {
-    // Commented out to prevent auth/internal-error on dynamic domains inside iframe environment
-    // appCheck = initializeAppCheck(app, {
-    //   provider: new ReCaptchaEnterpriseProvider("6Ld8c0wtAAAAAO1hk8NI6B_UU6qZmh7Zxs2nDEJi"),
-    //   isTokenAutoRefreshEnabled: true
-    // });
-    console.log("[Firebase] App Check skipped to prevent auth conflicts.");
+    appCheck = initializeAppCheck(app, {
+      provider: new ReCaptchaEnterpriseProvider("6Lf61EwtAAAAAMvpiXdg6Kv-A4Ke3GPo4nuN3IIe"),
+      isTokenAutoRefreshEnabled: true
+    });
+    console.log("[Firebase] App Check (reCAPTCHA Enterprise) initialized successfully.");
   } catch (err) {
-    console.warn("[Firebase] App Check initialization skipped/failed:", err);
+    console.warn("[Firebase] App Check (reCAPTCHA Enterprise) initialization skipped/failed:", err);
   }
 }
 
@@ -175,20 +176,106 @@ export const getProfileImageUrl = async (username: string, photoUpdatedAt: numbe
   }
 };
 
-const provider = new GoogleAuthProvider();
-// Add required Google Workspace scopes
-provider.addScope("https://www.googleapis.com/auth/calendar");
-provider.addScope("https://www.googleapis.com/auth/calendar.events");
-provider.addScope("https://www.googleapis.com/auth/drive.file");
-provider.addScope("https://www.googleapis.com/auth/drive.readonly");
-provider.addScope("https://www.googleapis.com/auth/spreadsheets");
-provider.addScope("https://www.googleapis.com/auth/documents");
-provider.addScope("https://www.googleapis.com/auth/tasks");
-provider.addScope("https://www.googleapis.com/auth/contacts");
-provider.addScope("https://www.googleapis.com/auth/contacts.readonly");
-provider.addScope("https://www.googleapis.com/auth/drive.metadata.readonly");
-provider.addScope("https://www.googleapis.com/auth/userinfo.profile");
-provider.addScope("https://www.googleapis.com/auth/userinfo.email");
+export const getGoogleProvider = (withWorkspaceScopes: boolean = true): GoogleAuthProvider => {
+  const p = new GoogleAuthProvider();
+  p.setCustomParameters({
+    prompt: "select_account"
+  });
+  
+  if (withWorkspaceScopes) {
+    p.addScope("https://www.googleapis.com/auth/calendar");
+    p.addScope("https://www.googleapis.com/auth/calendar.events");
+    p.addScope("https://www.googleapis.com/auth/drive.file");
+    p.addScope("https://www.googleapis.com/auth/drive.readonly");
+    p.addScope("https://www.googleapis.com/auth/spreadsheets");
+    p.addScope("https://www.googleapis.com/auth/documents");
+    p.addScope("https://www.googleapis.com/auth/tasks");
+    p.addScope("https://www.googleapis.com/auth/contacts");
+    p.addScope("https://www.googleapis.com/auth/contacts.readonly");
+    p.addScope("https://www.googleapis.com/auth/drive.metadata.readonly");
+  }
+  
+  p.addScope("https://www.googleapis.com/auth/userinfo.profile");
+  p.addScope("https://www.googleapis.com/auth/userinfo.email");
+  
+  return p;
+};
+
+export interface AuthLogEntry {
+  timestamp: string;
+  type: "info" | "warn" | "error" | "success";
+  message: string;
+  details?: any;
+}
+
+class AuthDebugLogger {
+  private logs: AuthLogEntry[] = [];
+  private listeners: ((logs: AuthLogEntry[]) => void)[] = [];
+
+  constructor() {
+    // Add logger to window for quick console diagnostics
+    if (typeof window !== "undefined") {
+      (window as any).authLogger = this;
+    }
+  }
+
+  log(type: "info" | "warn" | "error" | "success", message: string, details?: any) {
+    const entry: AuthLogEntry = {
+      timestamp: new Date().toISOString(),
+      type,
+      message,
+      details: details ? this.sanitize(details) : undefined
+    };
+    this.logs.push(entry);
+    console.log(`[AuthDebugLogger] [${type.toUpperCase()}] ${message}`, details || "");
+    this.listeners.forEach(listener => listener([...this.logs]));
+  }
+
+  getLogs() {
+    return [...this.logs];
+  }
+
+  clear() {
+    this.logs = [];
+    this.listeners.forEach(listener => listener([]));
+    this.log("info", "Auth log cleared");
+  }
+
+  subscribe(listener: (logs: AuthLogEntry[]) => void) {
+    this.listeners.push(listener);
+    listener([...this.logs]);
+    return () => {
+      this.listeners = this.listeners.filter(l => l !== listener);
+    };
+  }
+
+  private sanitize(val: any): any {
+    try {
+      // Prevent cyclic reference crashes and format errors nicely
+      const seen = new WeakSet();
+      return JSON.parse(JSON.stringify(val, (key, value) => {
+        if (value instanceof Error) {
+          const error: any = {};
+          Object.getOwnPropertyNames(value).forEach((k) => {
+            error[k] = (value as any)[k];
+          });
+          return error;
+        }
+        if (typeof value === "object" && value !== null) {
+          if (seen.has(value)) {
+            return "[Circular]";
+          }
+          seen.add(value);
+        }
+        return value;
+      }));
+    } catch (e) {
+      return String(val);
+    }
+  }
+}
+
+export const authLogger = new AuthDebugLogger();
 
 let cachedAccessToken: string | null = null;
 let isSigningIn = false;
@@ -202,42 +289,162 @@ export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
   onAuthFailure?: () => void
 ) => {
+  authLogger.log("info", "Initializing Firebase Auth State subscription");
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
+      authLogger.log("info", "Firebase Auth state changed: Logged In", {
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName,
+        hasCachedToken: !!cachedAccessToken
+      });
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
       } else {
-        // Fallback: If signed in but token was lost (e.g. reload), retrieve a fresh one or clear state
-        // To be safe in preview iframe, we can trigger re-login or use existing profile
+        authLogger.log("warn", "User is logged in, but cachedAccessToken was missing from flow. Triggering callback with empty token.");
         if (onAuthSuccess) onAuthSuccess(user, "");
       }
     } else {
+      authLogger.log("info", "Firebase Auth state changed: Logged Out");
       cachedAccessToken = null;
       if (onAuthFailure) onAuthFailure();
     }
   });
 };
 
-// Sign in with Google
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
+// Help diagnose browser sandbox environment constraints
+const getDiagnosticReport = (withWorkspaceScopes: boolean = true) => {
+  const report: any = {
+    userAgent: navigator.userAgent,
+    online: navigator.onLine,
+    isIframe: typeof window !== "undefined" && window.self !== window.top,
+    location: typeof window !== "undefined" ? window.location.href : "unknown",
+    cookiesEnabled: typeof navigator !== "undefined" ? navigator.cookieEnabled : "unknown",
+  };
+
+  // Test local/session storage support
+  try {
+    localStorage.setItem("__auth_diag_test__", "1");
+    localStorage.removeItem("__auth_diag_test__");
+    report.localStorageAccess = "granted";
+  } catch (e: any) {
+    report.localStorageAccess = "blocked";
+    report.localStorageAccessError = e?.message || String(e);
+  }
+
+  // Auth provider settings
+  try {
+    const prov = getGoogleProvider(withWorkspaceScopes);
+    report.providerId = prov.providerId;
+    report.withWorkspaceScopes = withWorkspaceScopes;
+  } catch (e) {}
+
+  return report;
+};
+
+// Sign in with Google (Popup)
+export const googleSignIn = async (withWorkspaceScopes: boolean = true): Promise<{ user: User; accessToken: string } | null> => {
+  authLogger.log("info", "Initiating googleSignIn (Popup method)", getDiagnosticReport(withWorkspaceScopes));
   try {
     isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
+    authLogger.log("info", "Calling Firebase signInWithPopup...");
+    const prov = getGoogleProvider(withWorkspaceScopes);
+    const result = await signInWithPopup(auth, prov);
+    
+    authLogger.log("success", "Successfully finished signInWithPopup", {
+      uid: result.user.uid,
+      displayName: result.user.displayName,
+      email: result.user.email
+    });
+
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
-      throw new Error("Failed to retrieve access token from Google Auth Provider");
+      const tokenError = new Error("Failed to retrieve access token from Google Auth Provider");
+      authLogger.log("error", "Google credential missing access token", { result });
+      throw tokenError;
     }
-    cachedAccessToken = credential.accessToken;
     
+    cachedAccessToken = credential.accessToken;
+    authLogger.log("info", "Retrieved Google API access token securely");
+
     // Auto-save user to RTDB "/users" structure
+    authLogger.log("info", "Registering user in Realtime Database...", { email: result.user.email });
     await registerUserInDb(result.user);
+    authLogger.log("success", "User profile successfully registered in RTDB database");
     
     return { user: result.user, accessToken: cachedAccessToken };
   } catch (error: any) {
+    authLogger.log("error", "Exception in googleSignIn (Popup)", {
+      code: error.code,
+      message: error.message,
+      customData: error.customData,
+      email: error.email,
+      credential: error.credential,
+      stack: error.stack
+    });
     console.error("Firebase Sign-in Error:", error);
     throw error;
   } finally {
     isSigningIn = false;
+  }
+};
+
+// Sign in with Google (Redirect)
+export const googleSignInRedirect = async (withWorkspaceScopes: boolean = true): Promise<void> => {
+  authLogger.log("info", "Initiating googleSignInRedirect (Redirect method)", getDiagnosticReport(withWorkspaceScopes));
+  try {
+    isSigningIn = true;
+    authLogger.log("info", "Calling Firebase signInWithRedirect...");
+    const prov = getGoogleProvider(withWorkspaceScopes);
+    await signInWithRedirect(auth, prov);
+  } catch (error: any) {
+    authLogger.log("error", "Exception in googleSignInRedirect", {
+      code: error.code,
+      message: error.message,
+      stack: error.stack
+    });
+    console.error("Firebase Redirect Sign-in Error:", error);
+    throw error;
+  } finally {
+    isSigningIn = false;
+  }
+};
+
+// Handle redirect result on load
+export const handleRedirectResult = async (): Promise<{ user: User; accessToken: string } | null> => {
+  authLogger.log("info", "Checking handleRedirectResult on app load", getDiagnosticReport());
+  try {
+    const result = await getRedirectResult(auth);
+    if (result) {
+      authLogger.log("success", "Successfully resolved redirect sign-in result", {
+        uid: result.user.uid,
+        displayName: result.user.displayName,
+        email: result.user.email
+      });
+
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      if (credential?.accessToken) {
+        cachedAccessToken = credential.accessToken;
+        authLogger.log("info", "Retrieved Google API access token via redirect credential");
+        
+        await registerUserInDb(result.user);
+        authLogger.log("success", "User profile registered in RTDB via redirect flow");
+        return { user: result.user, accessToken: cachedAccessToken };
+      } else {
+        authLogger.log("warn", "Redirect sign-in completed but did not yield an access token.");
+      }
+    } else {
+      authLogger.log("info", "No redirect sign-in result detected (standard page load)");
+    }
+    return null;
+  } catch (error: any) {
+    authLogger.log("error", "Exception in handleRedirectResult", {
+      code: error.code,
+      message: error.message,
+      stack: error.stack
+    });
+    console.error("Redirect auth retrieval failed:", error);
+    throw error;
   }
 };
 
