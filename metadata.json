@@ -1,0 +1,8 @@
+{
+  "name": "Life OS",
+  "description": "An all-in-one productivity and personal OS system with Google Workspace calendar, tasks, contacts, and drive integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
