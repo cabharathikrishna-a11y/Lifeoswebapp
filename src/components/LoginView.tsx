@@ -16,6 +16,64 @@ export default function LoginView({ onLogin, isLoggingIn, error }: LoginViewProp
     callback(useRedirect, withWorkspaceScopes);
   };
 
+  if (error === "ACCOUNT_NOT_FOUND") {
+    return (
+      <div className="min-h-screen w-full bg-[#030712] text-gray-100 flex flex-col justify-between p-6 relative overflow-hidden" id="login-container">
+        {/* Background ambient light effects */}
+        <div className="absolute top-0 left-1/4 w-96 h-96 bg-red-600/10 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-amber-600/10 rounded-full blur-3xl pointer-events-none" />
+
+        {/* Header */}
+        <header className="max-w-7xl mx-auto w-full flex items-center justify-between py-4 z-10 shrink-0">
+          <div className="flex items-center gap-2.5">
+            <LogoIcon className="h-6 w-6" />
+            <span className="font-sans font-extrabold text-lg tracking-wider text-white uppercase">Life OS</span>
+          </div>
+        </header>
+
+        {/* Main Block Box */}
+        <main className="max-w-md w-full mx-auto my-auto flex flex-col items-center justify-center z-10 space-y-6 py-6 text-center">
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="w-20 h-20 bg-red-500/10 border border-red-500/20 text-red-500 rounded-2xl flex items-center justify-center shadow-lg"
+          >
+            <ShieldAlert className="w-10 h-10 animate-bounce" />
+          </motion.div>
+
+          <div className="space-y-3">
+            <h2 className="text-2xl font-black tracking-tight text-white uppercase font-sans">
+              Account Not Found
+            </h2>
+            <p className="text-sm text-gray-400 max-w-sm mx-auto leading-relaxed">
+              We couldn't find your account details in our system database. Please create an account using your main Life OS application before attempting to log in.
+            </p>
+          </div>
+
+          <div className="w-full max-w-sm bg-red-500/5 border border-red-500/10 rounded-2xl p-6 space-y-4">
+            <p className="text-sm text-red-300 font-bold uppercase tracking-wider font-mono">
+              please create ur account via Life os app
+            </p>
+            <button
+              onClick={() => {
+                window.location.reload();
+              }}
+              className="w-full py-2.5 px-4 bg-gray-800 hover:bg-gray-700 text-gray-200 font-bold rounded-xl transition-all active:scale-[0.99] text-xs font-mono uppercase tracking-wider cursor-pointer"
+            >
+              Go Back / Try Again
+            </button>
+          </div>
+        </main>
+
+        <footer className="max-w-7xl mx-auto w-full text-center py-4 z-10 shrink-0">
+          <p className="text-[10px] text-gray-600 font-bold uppercase tracking-widest font-mono">
+            Powered by Google Cloud Run Container Sandbox & Firestore
+          </p>
+        </footer>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen w-full bg-[#030712] text-gray-100 flex flex-col justify-between p-6 relative overflow-hidden" id="login-container">
       {/* Background ambient light effects */}

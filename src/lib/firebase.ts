@@ -287,7 +287,7 @@ let bellListenerUnsubscribe: (() => void) | null = null;
 // Initialize auth state listener.
 export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
-  onAuthFailure?: () => void
+  onAuthFailure?: (reason?: string) => void
 ) => {
   authLogger.log("info", "Initializing Firebase Auth State subscription");
   return onAuthStateChanged(auth, async (user: User | null) => {
@@ -298,6 +298,28 @@ export const initAuth = (
         displayName: user.displayName,
         hasCachedToken: !!cachedAccessToken
       });
+
+      const username = getUsernameFromEmail(user.email || "");
+      if (username) {
+        try {
+          const userRef = ref(database, `users/${username}`);
+          const snapshot = await get(userRef);
+          if (!snapshot.exists()) {
+            authLogger.log("warn", "User authenticated but no profile found in RTDB. Rejecting session.");
+            await signOut(auth).catch(() => {});
+            cachedAccessToken = null;
+            if (onAuthFailure) onAuthFailure("ACCOUNT_NOT_FOUND");
+            return;
+          }
+        } catch (err) {
+          console.error("Failed to verify user registration in RTDB:", err);
+          await signOut(auth).catch(() => {});
+          cachedAccessToken = null;
+          if (onAuthFailure) onAuthFailure();
+          return;
+        }
+      }
+
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
       } else {
@@ -383,6 +405,8 @@ export const googleSignIn = async (withWorkspaceScopes: boolean = true): Promise
       stack: error.stack
     });
     console.error("Firebase Sign-in Error:", error);
+    await signOut(auth).catch(() => {});
+    cachedAccessToken = null;
     throw error;
   } finally {
     isSigningIn = false;
@@ -444,6 +468,8 @@ export const handleRedirectResult = async (): Promise<{ user: User; accessToken:
       stack: error.stack
     });
     console.error("Redirect auth retrieval failed:", error);
+    await signOut(auth).catch(() => {});
+    cachedAccessToken = null;
     throw error;
   }
 };
@@ -456,7 +482,11 @@ const registerUserInDb = async (user: User) => {
   const userRef = ref(database, `users/${username}`);
   const snapshot = await get(userRef);
   
-  const existingData = snapshot.exists() ? snapshot.val() : {};
+  if (!snapshot.exists()) {
+    throw new Error("ACCOUNT_NOT_FOUND");
+  }
+  
+  const existingData = snapshot.val() || {};
   
   const updatePayload = {
     name: user.displayName || "Google User",
@@ -611,14 +641,34 @@ export const pauseWebSession = async (username: string) => {
 export const endWebSession = async (username: string) => {
   if (!username) return { status: "RELAXING" };
   const timerRef = ref(database, `users/${username}/active_timer`);
-  await runTransaction(timerRef, () => {
+  await runTransaction(timerRef, (currentData) => {
+    const now = Date.now();
+    const tzOffset = new Date().getTimezoneOffset();
+    
+    let focusMs = 0;
+    let breakMs = 0;
+    
+    if (currentData) {
+      focusMs = currentData.accumulatedFocusMs || 0;
+      if (currentData.status === "FOCUSING" && currentData.startTimeMs) {
+        focusMs += (now - currentData.startTimeMs);
+      }
+      
+      breakMs = currentData.accumulatedBreakMs || 0;
+      if (currentData.status === "BREAK" && currentData.startTimeMs) {
+        breakMs += (now - currentData.startTimeMs);
+      }
+    }
+    
     return {
       status: "RELAXING",
       startTimeMs: 0,
-      accumulatedFocusMs: 0,
-      taskTitle: "",
-      tag: "",
-      lastUpdatedTimestamp: Date.now()
+      accumulatedFocusMs: focusMs,
+      accumulatedBreakMs: breakMs,
+      timezoneOffsetMinutes: tzOffset,
+      taskTitle: currentData?.taskTitle || "General Focus",
+      tag: currentData?.tag || "Study",
+      lastUpdatedTimestamp: now
     };
   });
   return { status: "RELAXING" };
@@ -690,6 +740,7 @@ export const listenToMyFocusRecords = (
   const paths = [
     `users/${username}/focusRecords`,
     `users/${username}/focus_records`,
+    `users/${username}/history_logs`,
     `focusRecords/${username}`,
     `focus_records/${username}`
   ];
@@ -715,18 +766,54 @@ export const listenToMyFocusRecords = (
             }).filter(Boolean);
           }
 
-          mappedList = list.map((rec: any) => ({
-            id: rec.id || String(rec.timestamp || Math.random()),
-            taskTitle: rec.taskTitle || rec.title || rec.taskName || "Focus Session",
-            tag: rec.tag || rec.category || "Study",
-            notes: rec.notes || rec.description || "",
-            durationSeconds: Number(rec.durationSeconds || (rec.durationMinutes ? rec.durationMinutes * 60 : 0) || 0),
-            durationMinutes: Number(rec.durationMinutes || (rec.durationSeconds ? Math.round(rec.durationSeconds / 60) : 0) || 0),
-            dateString: rec.dateString || new Date(rec.timestamp || Date.now()).toISOString().split("T")[0],
-            startTime: rec.startTime || "00:00",
-            endTime: rec.endTime || "00:00",
-            timestamp: Number(rec.timestamp || Date.now())
-          }));
+          mappedList = list.map((rec: any) => {
+            const ts = Number(rec.timestamp || rec.endTime || rec.startTime || Date.now());
+            
+            let startStr = "00:00";
+            if (rec.startTime) {
+              if (typeof rec.startTime === "number") {
+                startStr = new Date(rec.startTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+              } else {
+                startStr = String(rec.startTime);
+              }
+            }
+
+            let endStr = "00:00";
+            if (rec.endTime) {
+              if (typeof rec.endTime === "number") {
+                endStr = new Date(rec.endTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+              } else {
+                endStr = String(rec.endTime);
+              }
+            }
+
+            const computedSecs = Number(
+              rec.durationSeconds || 
+              (rec.totalFocusTimeMs ? Math.round(rec.totalFocusTimeMs / 1000) : 0) || 
+              (rec.durationMinutes ? rec.durationMinutes * 60 : 0) || 
+              0
+            );
+
+            const computedMins = Number(
+              rec.durationMinutes || 
+              (rec.totalFocusTimeMs ? Math.round(rec.totalFocusTimeMs / 60000) : 0) || 
+              (rec.durationSeconds ? Math.round(rec.durationSeconds / 60) : 0) || 
+              0
+            );
+
+            return {
+              id: rec.id || String(ts || Math.random()),
+              taskTitle: rec.taskTitle || rec.title || rec.taskName || "Focus Session",
+              tag: rec.tag || rec.category || "Study",
+              notes: rec.notes || rec.description || "",
+              durationSeconds: computedSecs,
+              durationMinutes: computedMins,
+              dateString: rec.dateString || new Date(ts).toISOString().split("T")[0],
+              startTime: startStr,
+              endTime: endStr,
+              timestamp: ts
+            };
+          });
         } catch (err) {
           console.error(`Error parsing focus records from path ${path}:`, err);
         }

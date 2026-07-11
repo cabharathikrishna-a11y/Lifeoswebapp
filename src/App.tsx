@@ -209,31 +209,6 @@ export default function App() {
     startTime: string;
     isPomodoro: boolean;
   }) => {
-    if (data.elapsedSecs <= 0) {
-      resetTimerGlobal();
-      return;
-    }
-
-    const durationMinutes = Math.max(1, Math.round(data.elapsedSecs / 60));
-    const endTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-    if (data.elapsedSecs > 10) {
-      const record: FocusRecord = {
-        id: Math.random().toString(36).substring(2, 9),
-        taskTitle: data.taskTitle || "Manual Focus Session",
-        tag: data.tag || "Study",
-        notes: data.notes || "Stopwatch log",
-        durationMinutes: durationMinutes,
-        durationSeconds: data.elapsedSecs,
-        dateString: new Date().toISOString().split("T")[0],
-        startTime: data.startTime || new Date(Date.now() - data.elapsedSecs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        endTime: endTime,
-        timestamp: Date.now()
-      };
-
-      handleAddFocusRecord(record);
-    }
-
     // Reset everything locally
     localStorage.setItem("life_os_timer_is_running", "false");
     localStorage.setItem("life_os_stopwatch_seconds", "0");
@@ -544,7 +519,12 @@ export default function App() {
         }
       } catch (err: any) {
         console.error("Redirect login recovery failed:", err);
-        setLoginError(err?.code || err?.message || String(err));
+        const errorMsg = err?.message || String(err);
+        if (errorMsg.includes("ACCOUNT_NOT_FOUND")) {
+          setLoginError("ACCOUNT_NOT_FOUND");
+        } else {
+          setLoginError(err?.code || errorMsg);
+        }
       }
     };
     checkRedirect();
@@ -557,9 +537,12 @@ export default function App() {
           setAccessToken(token);
         }
       },
-      () => {
+      (reason) => {
         setCurrentUser(null);
         setAccessToken(null);
+        if (reason === "ACCOUNT_NOT_FOUND") {
+          setLoginError("ACCOUNT_NOT_FOUND");
+        }
       }
     );
 
@@ -755,7 +738,12 @@ export default function App() {
       }
     } catch (e: any) {
       console.error("Google login failed:", e);
-      setLoginError(e?.code || e?.message || String(e));
+      const errorMsg = e?.message || String(e);
+      if (errorMsg.includes("ACCOUNT_NOT_FOUND")) {
+        setLoginError("ACCOUNT_NOT_FOUND");
+      } else {
+        setLoginError(e?.code || errorMsg);
+      }
     } finally {
       setIsLoggingIn(false);
     }

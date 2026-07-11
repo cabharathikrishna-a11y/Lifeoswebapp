@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { FocusRecord, Task } from "../types.ts";
 import { Play, Pause, RotateCcw, Flame, Users, Calendar, Sparkles, Maximize2, Minimize2, Eye, Clipboard, List, Tag, BellRing, Plus } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
@@ -153,6 +153,9 @@ export default function TimerView({
   const [isImmersive, setIsImmersive] = useState(false);
   const [showControls, setShowControls] = useState(true);
   const [currentQuote, setCurrentQuote] = useState("");
+
+  // Optimistic UI state to bypass Firebase roundtrip latency
+  const [optimisticState, setOptimisticState] = useState<any | null>(null);
 
   // Manual Time Entry States
   const [manualMinutes, setManualMinutes] = useState<string>("");
@@ -443,10 +446,36 @@ export default function TimerView({
     return () => clearInterval(timer);
   }, []);
 
+  // Active timer structure we will work with (either optimistic or from myStatusNode)
+  const activeTimerData = useMemo(() => {
+    if (optimisticState) {
+      return optimisticState;
+    }
+    return myStatusNode?.active_timer || {};
+  }, [optimisticState, myStatusNode]);
+
+  // Sync passive database and clear optimistic state once synced
+  useEffect(() => {
+    if (!myStatusNode || !optimisticState) return;
+    const activeTimer = myStatusNode.active_timer || {};
+    if (activeTimer.status === optimisticState.status) {
+      setOptimisticState(null);
+    }
+  }, [myStatusNode, optimisticState]);
+
+  // Safety timeout to clear optimistic state if it never syncs
+  useEffect(() => {
+    if (!optimisticState) return;
+    const timeout = setTimeout(() => {
+      setOptimisticState(null);
+    }, 5000); // 5 seconds safety gate
+    return () => clearTimeout(timeout);
+  }, [optimisticState]);
+
   // Sync state variables from active_timer passively
   useEffect(() => {
-    if (!myStatusNode) return;
-    const activeTimer = myStatusNode.active_timer || {};
+    const activeTimer = activeTimerData;
+    if (!optimisticState && !myStatusNode) return;
     const status = activeTimer.status || "RELAXING";
     const startTimeMs = activeTimer.startTimeMs || 0;
     const accumulatedFocusMs = activeTimer.accumulatedFocusMs || 0;
@@ -479,7 +508,7 @@ export default function TimerView({
       setStopwatchSeconds(0);
       setTimeLeft(Math.max(0, pomodoroMinutes * 60 - elapsedSecs));
     }
-  }, [myStatusNode, pomodoroMinutes, tasks]);
+  }, [activeTimerData, optimisticState, myStatusNode, pomodoroMinutes, tasks, now]);
 
   // Start / Pause timer
   const handleStartPause = async () => {
@@ -489,9 +518,44 @@ export default function TimerView({
     const taskTitle = activeTask ? activeTask.title : "General Focus Session";
 
     if (isRunning) {
-      await pauseWebSession(username).catch((err: any) => console.error("Pause session failed:", err));
+      const nowMs = Date.now();
+      const prevActiveTimer = myStatusNode?.active_timer || {};
+      const prevAccumulated = prevActiveTimer.accumulatedFocusMs || 0;
+      let additional = 0;
+      if (prevActiveTimer.status === "FOCUSING" && prevActiveTimer.startTimeMs) {
+        additional = nowMs - prevActiveTimer.startTimeMs;
+      }
+      setOptimisticState({
+        status: "BREAK",
+        startTimeMs: 0,
+        accumulatedFocusMs: prevAccumulated + additional,
+        isStopwatchMode: !isPomodoro,
+        tag: activeTag,
+        taskTitle: taskTitle
+      });
+
+      await pauseWebSession(username).catch((err: any) => {
+        console.error("Pause session failed:", err);
+        setOptimisticState(null);
+      });
     } else {
-      await startWebSession(username, taskTitle, activeTag, !isPomodoro).catch((err: any) => console.error("Start session failed:", err));
+      const nowMs = Date.now();
+      const prevActiveTimer = myStatusNode?.active_timer || {};
+      const prevAccumulated = prevActiveTimer.accumulatedFocusMs || 0;
+
+      setOptimisticState({
+        status: "FOCUSING",
+        startTimeMs: nowMs,
+        accumulatedFocusMs: prevAccumulated,
+        isStopwatchMode: !isPomodoro,
+        tag: activeTag,
+        taskTitle: taskTitle
+      });
+
+      await startWebSession(username, taskTitle, activeTag, !isPomodoro).catch((err: any) => {
+        console.error("Start session failed:", err);
+        setOptimisticState(null);
+      });
     }
   };
 
@@ -500,23 +564,6 @@ export default function TimerView({
     if (!currentUser) return;
     const username = getUsernameFromEmail(currentUser.email);
 
-    const activeTask = tasks.find(t => t.id === selectedTaskId);
-    const endTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    
-    const record: FocusRecord = {
-      id: Math.random().toString(36).substring(2, 9),
-      taskTitle: activeTask ? activeTask.title : "General Focus Session",
-      tag: activeTag,
-      notes: sessionNotes || "Completed pomodoro.",
-      durationMinutes: pomodoroMinutes,
-      durationSeconds: pomodoroMinutes * 60,
-      dateString: new Date().toISOString().split("T")[0],
-      startTime: startTimeRef.current || new Date(Date.now() - pomodoroMinutes*60*1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      endTime: endTime,
-      timestamp: Date.now()
-    };
-
-    onAddFocusRecord(record);
     setSessionNotes("");
 
     await endWebSession(username).catch((err: any) => console.error("End session failed:", err));
@@ -541,29 +588,33 @@ export default function TimerView({
     if (!currentUser) return;
     const username = getUsernameFromEmail(currentUser.email);
     const activeTask = tasks.find(t => t.id === selectedTaskId);
+    const taskTitle = activeTask ? activeTask.title : "General Focus Session";
 
-    const activeTimer = myStatusNode?.active_timer || {};
-    const status = activeTimer.status || "RELAXING";
-    const startTimeMs = activeTimer.startTimeMs || 0;
-    const accumulatedFocusMs = activeTimer.accumulatedFocusMs || 0;
-    let elapsedMs = accumulatedFocusMs;
-    if (status === "FOCUSING" && startTimeMs > 0) {
-      elapsedMs += (Date.now() - startTimeMs);
+    const nowMs = Date.now();
+    const prevActiveTimer = myStatusNode?.active_timer || {};
+    let focusMs = prevActiveTimer.accumulatedFocusMs || 0;
+    if (prevActiveTimer.status === "FOCUSING" && prevActiveTimer.startTimeMs) {
+      focusMs += (nowMs - prevActiveTimer.startTimeMs);
     }
-    const elapsedSecs = Math.round(elapsedMs / 1000);
-
-    if (onTriggerSaveModal) {
-      onTriggerSaveModal({
-        elapsedSecs,
-        defaultTaskTitle: activeTask ? activeTask.title : "Manual Focus Session",
-        defaultTag: activeTag,
-        defaultNotes: sessionNotes || (isPomodoro ? "Stopped early." : "Stopwatch log"),
-        startTime: startTimeRef.current || new Date(Date.now() - elapsedSecs * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        isPomodoro: isPomodoro
-      });
+    let breakMs = prevActiveTimer.accumulatedBreakMs || 0;
+    if (prevActiveTimer.status === "BREAK" && prevActiveTimer.startTimeMs) {
+      breakMs += (nowMs - prevActiveTimer.startTimeMs);
     }
 
-    await endWebSession(username).catch((err: any) => console.error("End session failed:", err));
+    setOptimisticState({
+      status: "RELAXING",
+      startTimeMs: 0,
+      accumulatedFocusMs: focusMs,
+      accumulatedBreakMs: breakMs,
+      isStopwatchMode: !isPomodoro,
+      tag: activeTag,
+      taskTitle: taskTitle
+    });
+
+    await endWebSession(username).catch((err: any) => {
+      console.error("End session failed:", err);
+      setOptimisticState(null);
+    });
     setSessionNotes("");
   };
 
@@ -644,7 +695,11 @@ export default function TimerView({
   // Calculate my total focus seconds exactly the same way as friends
   let myTotalFocusSeconds = 0;
   if (myStatusNode) {
-    myTotalFocusSeconds = getTodayFocusSecondsForUser(myStatusNode);
+    const overriddenNode = {
+      ...myStatusNode,
+      active_timer: activeTimerData
+    };
+    myTotalFocusSeconds = getTodayFocusSecondsForUser(overriddenNode);
   } else {
     myTotalFocusSeconds = Math.min(20 * 3600, totalFocusSeconds);
   }
