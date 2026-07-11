@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { FocusRecord, Task } from "../types.ts";
-import { Play, Pause, RotateCcw, Flame, Users, Calendar, Sparkles, Maximize2, Minimize2, Eye, Clipboard, List, Tag, BellRing, Plus } from "lucide-react";
+import { Play, Pause, RotateCcw, Flame, Users, Calendar, Sparkles, Maximize2, Minimize2, Eye, Clipboard, List, Tag, BellRing, Plus, Sliders, AlertTriangle } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
 // Real-time integration imports
-import { ringFriendBell, getUsernameFromEmail, addFocusRecordToDb, removeFocusRecordFromDb, startWebSession, pauseWebSession, endWebSession, getProfileImageUrl, submitManualEntry } from "../lib/firebase.ts";
+import { ringFriendBell, getUsernameFromEmail, addFocusRecordToDb, removeFocusRecordFromDb, startWebSession, pauseWebSession, endWebSession, getProfileImageUrl, submitManualEntry, startWebBreak, saveTimerSettings, toggleWebSessionMode } from "../lib/firebase.ts";
 import { User } from "firebase/auth";
 
 function safeParse<T>(str: string | null, fallback: T): T {
@@ -70,7 +70,11 @@ const renderAvatar = (avatarString: string, sizeClass: string = "w-8 h-8 text-xl
     );
   }
   
-  return <span className="text-xl shrink-0 select-none">{avatarString}</span>;
+  return (
+    <div className={`rounded-full flex items-center justify-center bg-blue-500/10 border border-blue-500/20 shrink-0 ${sizeClass}`}>
+      <span className="leading-none select-none flex items-center justify-center text-center">{avatarString}</span>
+    </div>
+  );
 };
 
 interface TimerViewProps {
@@ -101,43 +105,147 @@ export default function TimerView({
   myProfile,
   onTriggerSaveModal
 }: TimerViewProps) {
-  // Timer States
-  const [isPomodoro, setIsPomodoro] = useState<boolean>(() => {
+  // Optimistic UI state to bypass Firebase roundtrip latency
+  const [optimisticState, setOptimisticState] = useState<any | null>(null);
+
+  // Sync trigger to force render when localStorage changes externally
+  const [syncTrigger, setSyncTrigger] = useState(0);
+
+  // Active timer structure we will work with (either optimistic or from myStatusNode)
+  const activeTimerData = useMemo(() => {
+    if (optimisticState) {
+      return optimisticState;
+    }
+    return myStatusNode?.active_timer || {};
+  }, [optimisticState, myStatusNode]);
+
+  const [pomodoroMinutes, setPomodoroMinutes] = useState<number>(() => {
+    const saved = localStorage.getItem("life_os_pomodoro_minutes");
+    return safeParse(saved, 25);
+  });
+  const [breakMinutes, setBreakMinutes] = useState<number>(() => {
+    const saved = localStorage.getItem("life_os_break_minutes");
+    return safeParse(saved, 5);
+  });
+  const [autoStartBreak, setAutoStartBreak] = useState<boolean>(() => {
+    const saved = localStorage.getItem("life_os_auto_start_break");
+    return safeParse(saved, true);
+  });
+  const [autoStartPomo, setAutoStartPomo] = useState<boolean>(() => {
+    const saved = localStorage.getItem("life_os_auto_start_pomo");
+    return safeParse(saved, true);
+  });
+  const [autoStartStopwatchAfterBreak, setAutoStartStopwatchAfterBreak] = useState<boolean>(() => {
+    const saved = localStorage.getItem("life_os_auto_start_sw_after_break");
+    return safeParse(saved, false);
+  });
+
+  // Sync settings dynamically from Firebase
+  useEffect(() => {
+    const settings = myStatusNode?.timer_settings;
+    if (!settings) return;
+    
+    if (settings.timerDurationMinutes !== undefined) {
+      setPomodoroMinutes(settings.timerDurationMinutes);
+      localStorage.setItem("life_os_pomodoro_minutes", JSON.stringify(settings.timerDurationMinutes));
+    }
+    if (settings.stopwatchBreakDurationMinutes !== undefined) {
+      setBreakMinutes(settings.stopwatchBreakDurationMinutes);
+      localStorage.setItem("life_os_break_minutes", JSON.stringify(settings.stopwatchBreakDurationMinutes));
+    }
+    if (settings.autoStartBreak !== undefined) {
+      setAutoStartBreak(settings.autoStartBreak);
+      localStorage.setItem("life_os_auto_start_break", JSON.stringify(settings.autoStartBreak));
+    }
+    if (settings.autoStartPomo !== undefined) {
+      setAutoStartPomo(settings.autoStartPomo);
+      localStorage.setItem("life_os_auto_start_pomo", JSON.stringify(settings.autoStartPomo));
+    }
+    if (settings.autoStartStopwatchAfterBreak !== undefined) {
+      setAutoStartStopwatchAfterBreak(settings.autoStartStopwatchAfterBreak);
+      localStorage.setItem("life_os_auto_start_sw_after_break", JSON.stringify(settings.autoStartStopwatchAfterBreak));
+    }
+  }, [myStatusNode?.timer_settings]);
+
+  // Timer States (Internal Local Fallbacks)
+  const [localIsPomodoro, setLocalIsPomodoro] = useState<boolean>(() => {
     const saved = localStorage.getItem("life_os_is_pomodoro");
     return safeParse(saved, false);
   });
-  const [isRunning, setIsRunning] = useState<boolean>(() => {
+  const [localIsRunning, setLocalIsRunning] = useState<boolean>(() => {
     const saved = localStorage.getItem("life_os_timer_is_running");
     return safeParse(saved, false);
   });
-  const [timeLeft, setTimeLeft] = useState<number>(() => {
-    const saved = localStorage.getItem("life_os_timer_left");
-    return safeParse(saved, 25 * 60);
-  });
-  const [stopwatchSeconds, setStopwatchSeconds] = useState<number>(() => {
-    const savedRunning = localStorage.getItem("life_os_timer_is_running");
-    const isRunningVal = safeParse(savedRunning, false);
-    const savedIsPomodoro = localStorage.getItem("life_os_is_pomodoro");
-    const isPomodoroVal = safeParse(savedIsPomodoro, false);
 
-    const savedSecs = localStorage.getItem("life_os_stopwatch_seconds");
-    const stopwatchSecsVal = safeParse(savedSecs, 0);
+  // Live ticking state (updates every second to drive animations and elapsed calculations)
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
 
-    // In case stopwatch was active when browser closed, calculate the real elapsed seconds to now
-    if (isRunningVal && !isPomodoroVal) {
-      const savedLastResume = localStorage.getItem("life_os_last_resume_time");
-      const savedAccumulated = localStorage.getItem("life_os_accumulated_time");
-      if (savedLastResume) {
-        const lastResume = safeParse(savedLastResume, 0);
-        const accumulated = safeParse(savedAccumulated, 0);
-        if (lastResume > 0) {
-          const elapsedMs = Date.now() - lastResume;
-          return Math.round((accumulated + elapsedMs) / 1000);
+  // Compute live values for all visual rendering
+  const liveIsRunning = currentUser ? (activeTimerData?.status === "FOCUSING" || activeTimerData?.status === "BREAK") : localIsRunning;
+  const liveIsPomodoro = currentUser ? !activeTimerData?.isStopwatchMode : localIsPomodoro;
+
+  const liveElapsedSecs = useMemo(() => {
+    if (currentUser) {
+      const activeTimer = activeTimerData || {};
+      const status = activeTimer.status || "RELAXING";
+      const startTimeMs = activeTimer.startTimeMs ? Number(activeTimer.startTimeMs) : 0;
+      const accumulatedFocusMs = activeTimer.accumulatedFocusMs ? Number(activeTimer.accumulatedFocusMs) : 0;
+      const accumulatedBreakMs = activeTimer.accumulatedBreakMs ? Number(activeTimer.accumulatedBreakMs) : 0;
+      
+      if (status === "BREAK") {
+        let elapsedMs = accumulatedBreakMs;
+        if (startTimeMs > 0) {
+          elapsedMs += (now - startTimeMs);
         }
+        return Math.round(elapsedMs / 1000);
+      } else {
+        let elapsedMs = accumulatedFocusMs;
+        if (status === "FOCUSING" && startTimeMs > 0) {
+          elapsedMs += (now - startTimeMs); // Use 'now' to guarantee recalculation on every second!
+        }
+        return Math.round(elapsedMs / 1000);
+      }
+    } else {
+      // Offline mode fallback using local storage resume markers
+      const lastResume = safeParse(localStorage.getItem("life_os_last_resume_time"), null);
+      const accumulated = safeParse(localStorage.getItem("life_os_accumulated_time"), 0);
+      let elapsedMs = accumulated;
+      if (localIsRunning && lastResume && Number(lastResume) > 0) {
+        elapsedMs += (now - Number(lastResume));
+      }
+      return Math.round(elapsedMs / 1000);
+    }
+  }, [currentUser, activeTimerData, liveIsPomodoro, pomodoroMinutes, localIsRunning, now, syncTrigger]);
+
+  const liveTimeLeft = useMemo(() => {
+    if (currentUser) {
+      const activeTimer = activeTimerData || {};
+      const status = activeTimer.status || "RELAXING";
+      const targetEndTimeMs = activeTimer.targetEndTimeMs ? Number(activeTimer.targetEndTimeMs) : 0;
+      
+      if ((status === "FOCUSING" || status === "BREAK") && targetEndTimeMs > 0 && !activeTimer.isStopwatchMode) {
+        return Math.max(0, Math.round((targetEndTimeMs - now) / 1000));
       }
     }
-    return stopwatchSecsVal;
-  });
+    const status = activeTimerData?.status || "RELAXING";
+    const duration = status === "BREAK" ? (breakMinutes * 60) : (pomodoroMinutes * 60);
+    return liveIsPomodoro ? Math.max(0, duration - liveElapsedSecs) : duration;
+  }, [currentUser, activeTimerData, liveIsPomodoro, pomodoroMinutes, breakMinutes, liveElapsedSecs, now]);
+
+  const liveStopwatchSeconds = liveIsPomodoro ? 0 : liveElapsedSecs;
+
+  // Shadow variables for downstream use (JSX and handlers) so they use the correct live ticking values
+  const isRunning = liveIsRunning;
+  const isPomodoro = liveIsPomodoro;
+  const timeLeft = liveTimeLeft;
+  const stopwatchSeconds = liveStopwatchSeconds;
+
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(() => {
     const saved = localStorage.getItem("life_os_selected_task_id");
     return safeParse(saved, null);
@@ -154,20 +262,13 @@ export default function TimerView({
   const [showControls, setShowControls] = useState(true);
   const [currentQuote, setCurrentQuote] = useState("");
 
-  // Optimistic UI state to bypass Firebase roundtrip latency
-  const [optimisticState, setOptimisticState] = useState<any | null>(null);
-
   // Manual Time Entry States
   const [manualMinutes, setManualMinutes] = useState<string>("");
   const [manualReason, setManualReason] = useState<string>("");
   const [isSubmittingManual, setIsSubmittingManual] = useState<boolean>(false);
   const [manualSubmitStatus, setManualSubmitStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
-  // Constants
-  const [pomodoroMinutes, setPomodoroMinutes] = useState<number>(() => {
-    const saved = localStorage.getItem("life_os_pomodoro_minutes");
-    return safeParse(saved, 25);
-  });
+  // Constants & Refs
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<string>(
     safeParse(localStorage.getItem("life_os_start_time"), "")
@@ -177,21 +278,166 @@ export default function TimerView({
   // Visual/Animated bell ring cooldown state
   const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
 
-  // Persist states to localStorage
+  const [selectedFilter, setSelectedFilter] = useState<"Today" | "7 Days" | "30 Days" | "All Time">("Today");
+  const [showLimitAlert, setShowLimitAlert] = useState(false);
+  const [limitAlertMessage, setLimitAlertMessage] = useState("");
+
+  const getOverlapSecondsForDate = (r: any, targetDateStr: string) => {
+    try {
+      const dateStr = r.dateString || targetDateStr;
+      let timeParts = (r.endTime || "").split(" ");
+      let time = timeParts[0];
+      let ampm = timeParts[1];
+      if (!time) return r.durationSeconds || (r.durationMinutes * 60) || 0;
+      let [hours, minutes] = time.split(":").map(Number);
+      if (ampm && ampm.toLowerCase() === "pm" && hours < 12) {
+        hours += 12;
+      }
+      if (ampm && ampm.toLowerCase() === "am" && hours === 12) {
+        hours = 0;
+      }
+      
+      const endLocalDate = new Date(dateStr + "T00:00:00");
+      endLocalDate.setHours(hours, minutes, 0, 0);
+      const endMs = endLocalDate.getTime();
+      
+      const durationSeconds = r.durationSeconds || (r.durationMinutes * 60) || 0;
+      const startMs = endMs - (durationSeconds * 1000);
+      
+      const targetDate = new Date(targetDateStr + "T00:00:00");
+      const targetStartMs = targetDate.getTime();
+      
+      const targetEndMs = targetStartMs + 24 * 60 * 60 * 1000 - 1;
+      
+      const overlapStart = Math.max(startMs, targetStartMs);
+      const overlapEnd = Math.min(endMs, targetEndMs);
+      
+      if (overlapEnd > overlapStart) {
+        return Math.round((overlapEnd - overlapStart) / 1000);
+      }
+      return 0;
+    } catch (e) {
+      if (r.dateString === targetDateStr || !r.dateString) {
+        return r.durationSeconds || (r.durationMinutes * 60) || 0;
+      }
+      return 0;
+    }
+  };
+
+  const getFilteredFocusSecondsForUser = (userNode: any, filter: "Today" | "7 Days" | "30 Days" | "All Time") => {
+    if (!userNode) return 0;
+    if (filter === "Today") {
+      return getTodayFocusSecondsForUser(userNode);
+    }
+
+    const activeTimer = userNode.active_timer || {};
+    const status = activeTimer.status || "RELAXING";
+    const startTimeMs = activeTimer.startTimeMs || 0;
+    const accumulatedFocusMs = activeTimer.accumulatedFocusMs || 0;
+
+    let liveDelta = 0;
+    if (status === "FOCUSING" && startTimeMs > 0) {
+      liveDelta = (Date.now() - startTimeMs) + accumulatedFocusMs;
+    } else if (status === "BREAK") {
+      if (activeTimer.taskTitle !== "Taking a Break" && activeTimer.tag !== "Break") {
+        liveDelta = accumulatedFocusMs;
+      }
+    } else if (status === "PAUSED") {
+      liveDelta = accumulatedFocusMs;
+    }
+
+    const historyLogs = userNode.history_logs;
+    let recordsList: any[] = [];
+    if (historyLogs) {
+      if (Array.isArray(historyLogs)) {
+        recordsList = historyLogs.filter(Boolean);
+      } else if (typeof historyLogs === "object") {
+        recordsList = Object.keys(historyLogs).map(k => {
+          if (typeof historyLogs[k] === "object" && historyLogs[k] !== null) {
+            return { id: k, ...historyLogs[k] };
+          }
+          return null;
+        }).filter(Boolean);
+      }
+    }
+
+    const targetDates: string[] = [];
+    const today = new Date();
+    const daysCount = filter === "7 Days" ? 7 : (filter === "30 Days" ? 30 : 365);
+    
+    if (filter !== "All Time") {
+      for (let i = 0; i < daysCount; i++) {
+        const d = new Date(today);
+        d.setDate(today.getDate() - i);
+        targetDates.push(d.toISOString().split("T")[0]);
+      }
+    }
+
+    const completedSeconds = recordsList.reduce((sum, r) => {
+      if (filter === "All Time") {
+        const computedSecs = r.durationSeconds || (r.durationMinutes * 60) || 0;
+        return sum + computedSecs;
+      } else {
+        let overlapSum = 0;
+        for (const dateStr of targetDates) {
+          overlapSum += getOverlapSecondsForDate(r, dateStr);
+        }
+        return sum + overlapSum;
+      }
+    }, 0);
+
+    return Math.round((completedSeconds * 1000 + liveDelta) / 1000);
+  };
+
+  // Calculate today's completed focus records seconds (splitting by overlap for date boundaries)
+  const todayCompletedSeconds = useMemo(() => {
+    const todayStr = new Date().toISOString().split("T")[0];
+    return focusRecords.reduce((acc, r) => acc + getOverlapSecondsForDate(r, todayStr), 0);
+  }, [focusRecords]);
+
+  const formatSecondsForLeaderboard = (totalSecs: number, filter: string) => {
+    if (filter === "Today") {
+      return formatSecondsToDetailed(totalSecs);
+    }
+    const hrs = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    if (hrs > 0) {
+      return `${hrs}h ${mins}m`;
+    }
+    return `${mins}m`;
+  };
+
+  // Persist states to localStorage with change-guards to avoid event storms
   useEffect(() => {
-    localStorage.setItem("life_os_is_pomodoro", JSON.stringify(isPomodoro));
+    const val = JSON.stringify(isPomodoro);
+    if (localStorage.getItem("life_os_is_pomodoro") !== val) {
+      localStorage.setItem("life_os_is_pomodoro", val);
+      window.dispatchEvent(new Event("life_os_timer_changed"));
+    }
   }, [isPomodoro]);
 
   useEffect(() => {
-    localStorage.setItem("life_os_timer_is_running", JSON.stringify(isRunning));
+    const val = JSON.stringify(isRunning);
+    if (localStorage.getItem("life_os_timer_is_running") !== val) {
+      localStorage.setItem("life_os_timer_is_running", val);
+      window.dispatchEvent(new Event("life_os_timer_changed"));
+    }
   }, [isRunning]);
 
   useEffect(() => {
-    localStorage.setItem("life_os_timer_left", JSON.stringify(timeLeft));
+    const val = JSON.stringify(timeLeft);
+    if (localStorage.getItem("life_os_timer_left") !== val) {
+      localStorage.setItem("life_os_timer_left", val);
+      window.dispatchEvent(new Event("life_os_timer_changed"));
+    }
   }, [timeLeft]);
 
   useEffect(() => {
-    localStorage.setItem("life_os_stopwatch_seconds", JSON.stringify(stopwatchSeconds));
+    const val = JSON.stringify(stopwatchSeconds);
+    if (localStorage.getItem("life_os_stopwatch_seconds") !== val) {
+      localStorage.setItem("life_os_stopwatch_seconds", val);
+      window.dispatchEvent(new Event("life_os_timer_changed"));
+    }
   }, [stopwatchSeconds]);
 
   useEffect(() => {
@@ -210,35 +456,33 @@ export default function TimerView({
     localStorage.setItem("life_os_session_notes", JSON.stringify(sessionNotes));
   }, [sessionNotes]);
 
-  // Notify App.tsx of timer changes
+  // Real-time daily and session focus limit checks (20 hours & 6 hours)
   useEffect(() => {
-    window.dispatchEvent(new Event("life_os_timer_changed"));
-  }, [isRunning, stopwatchSeconds, timeLeft, isPomodoro]);
+    if (isRunning) {
+      const currentSessionSecs = isPomodoro ? (pomodoroMinutes * 60 - timeLeft) : stopwatchSeconds;
+      const totalTodaySecs = todayCompletedSeconds + currentSessionSecs;
+      
+      if (currentSessionSecs >= 21600) { // 6 hours session limit
+        if (isPomodoro) {
+          handleTimerComplete();
+        } else {
+          handleSkipStop();
+        }
+        setLimitAlertMessage("⚠️ Session focus limit of 6 hours reached! The session has been completed and logged.");
+        setShowLimitAlert(true);
+      } else if (totalTodaySecs >= 72000) { // 20 hours daily limit
+        handleStartPause(); // Auto-pause
+        setLimitAlertMessage("⚠️ Daily focus limit of 20 hours reached! Timer has been paused.");
+        setShowLimitAlert(true);
+      }
+    }
+  }, [now, isRunning, todayCompletedSeconds, isPomodoro, pomodoroMinutes, timeLeft, stopwatchSeconds]);
 
   // Sync from other components via life_os_timer_changed event
   useEffect(() => {
     const handleTimerChangedExternal = () => {
       const storedRunning = localStorage.getItem("life_os_timer_is_running") === "true";
       const storedIsPomodoro = localStorage.getItem("life_os_is_pomodoro") === "true";
-      
-      const storedTimeLeftVal = localStorage.getItem("life_os_timer_left");
-      const storedTimeLeft = safeParse(storedTimeLeftVal, 25 * 60);
-
-      const storedStopwatchSecsVal = localStorage.getItem("life_os_stopwatch_seconds");
-      let storedStopwatchSeconds = safeParse(storedStopwatchSecsVal, 0);
-      
-      if (storedRunning && !storedIsPomodoro) {
-        const savedLastResume = localStorage.getItem("life_os_last_resume_time");
-        const savedAccumulated = localStorage.getItem("life_os_accumulated_time");
-        if (savedLastResume) {
-          const lastResume = safeParse(savedLastResume, 0);
-          const accumulated = safeParse(savedAccumulated, 0);
-          if (lastResume > 0) {
-            const elapsedMs = Date.now() - lastResume;
-            storedStopwatchSeconds = Math.round((accumulated + elapsedMs) / 1000);
-          }
-        }
-      }
 
       if (!storedRunning) {
         lastResumeTimeMsRef.current = null;
@@ -254,52 +498,30 @@ export default function TimerView({
         }
       }
 
-      if (isRunning !== storedRunning) {
-        setIsRunning(storedRunning);
-      }
-      if (isPomodoro !== storedIsPomodoro) {
-        setIsPomodoro(storedIsPomodoro);
-      }
-      if (timeLeft !== storedTimeLeft) {
-        setTimeLeft(storedTimeLeft);
-        timeLeftRef.current = storedTimeLeft;
-      }
-      if (stopwatchSeconds !== storedStopwatchSeconds) {
-        setStopwatchSeconds(storedStopwatchSeconds);
-        stopwatchSecondsRef.current = storedStopwatchSeconds;
-      }
+      setLocalIsRunning(prev => prev !== storedRunning ? storedRunning : prev);
+      setLocalIsPomodoro(prev => prev !== storedIsPomodoro ? storedIsPomodoro : prev);
 
       const storedTaskIdVal = localStorage.getItem("life_os_selected_task_id");
       const storedTaskId = safeParse(storedTaskIdVal, null);
-      if (selectedTaskId !== storedTaskId) {
-        setSelectedTaskId(storedTaskId);
-      }
+      setSelectedTaskId(prev => prev !== storedTaskId ? storedTaskId : prev);
 
       const storedTagVal = localStorage.getItem("life_os_active_tag");
       const storedTag = safeParse(storedTagVal, "Study");
-      if (activeTag !== storedTag) {
-        setActiveTag(storedTag);
-      }
+      setActiveTag(prev => prev !== storedTag ? storedTag : prev);
 
       const storedNotesVal = localStorage.getItem("life_os_session_notes");
       const storedNotes = safeParse(storedNotesVal, "");
-      if (sessionNotes !== storedNotes) {
-        setSessionNotes(storedNotes);
-      }
+      setSessionNotes(prev => prev !== storedNotes ? storedNotes : prev);
+
+      // Force a visual update
+      setSyncTrigger(prev => prev + 1);
     };
 
     window.addEventListener("life_os_timer_changed", handleTimerChangedExternal);
     return () => {
       window.removeEventListener("life_os_timer_changed", handleTimerChangedExternal);
     };
-  }, [isRunning, isPomodoro, timeLeft, stopwatchSeconds, selectedTaskId, activeTag, sessionNotes]);
-
-  // Handle active countdown setting changes
-  useEffect(() => {
-    if (isPomodoro && !isRunning) {
-      setTimeLeft(pomodoroMinutes * 60);
-    }
-  }, [pomodoroMinutes, isPomodoro]);
+  }, [tasks]);
 
   // Keep mutable references of elapsed times to avoid stale closures in keep-alive syncs
   const timeLeftRef = useRef(timeLeft);
@@ -409,6 +631,10 @@ export default function TimerView({
     if (status === "FOCUSING" && startTimeMs > 0) {
       liveDelta = (Date.now() - startTimeMs) + accumulatedFocusMs;
     } else if (status === "BREAK") {
+      if (activeTimer.taskTitle !== "Taking a Break" && activeTimer.tag !== "Break") {
+        liveDelta = accumulatedFocusMs;
+      }
+    } else if (status === "PAUSED") {
       liveDelta = accumulatedFocusMs;
     }
 
@@ -437,23 +663,6 @@ export default function TimerView({
     return `${secs}s`;
   };
 
-  // Visual ticking state
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setNow(Date.now());
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  // Active timer structure we will work with (either optimistic or from myStatusNode)
-  const activeTimerData = useMemo(() => {
-    if (optimisticState) {
-      return optimisticState;
-    }
-    return myStatusNode?.active_timer || {};
-  }, [optimisticState, myStatusNode]);
-
   // Sync passive database and clear optimistic state once synced
   useEffect(() => {
     if (!myStatusNode || !optimisticState) return;
@@ -477,42 +686,134 @@ export default function TimerView({
     const activeTimer = activeTimerData;
     if (!optimisticState && !myStatusNode) return;
     const status = activeTimer.status || "RELAXING";
-    const startTimeMs = activeTimer.startTimeMs || 0;
-    const accumulatedFocusMs = activeTimer.accumulatedFocusMs || 0;
     const isStopwatchMode = !!activeTimer.isStopwatchMode;
 
     const incomingIsFocusing = status === "FOCUSING";
-    setIsRunning(incomingIsFocusing);
-    setIsPomodoro(!isStopwatchMode);
+    
+    // Only set if different to prevent re-render loops!
+    setLocalIsRunning(prev => prev !== incomingIsFocusing ? incomingIsFocusing : prev);
+    setLocalIsPomodoro(prev => {
+      const next = !isStopwatchMode;
+      return prev !== next ? next : prev;
+    });
 
     if (activeTimer.tag) {
-      setActiveTag(activeTimer.tag);
+      setActiveTag(prev => prev !== activeTimer.tag ? activeTimer.tag : prev);
     }
     if (activeTimer.taskTitle) {
       const foundTask = tasks.find(t => t.title.toLowerCase() === activeTimer.taskTitle.toLowerCase());
       if (foundTask) {
-        setSelectedTaskId(foundTask.id);
+        setSelectedTaskId(prev => prev !== foundTask.id ? foundTask.id : prev);
       }
     }
+  }, [activeTimerData, optimisticState, myStatusNode, tasks]);
 
-    let elapsedMs = accumulatedFocusMs;
-    if (status === "FOCUSING" && startTimeMs > 0) {
-      elapsedMs += (Date.now() - startTimeMs);
+  // Mode toggle between Pomodoro and Stopwatch
+  const handleToggleMode = async (toPomodoro: boolean) => {
+    if (isRunning) return; // Prevent changing mode while running
+    
+    setLocalIsPomodoro(toPomodoro);
+    localStorage.setItem("life_os_is_pomodoro", JSON.stringify(toPomodoro));
+    
+    if (currentUser) {
+      const username = getUsernameFromEmail(currentUser.email);
+      try {
+        await toggleWebSessionMode(username, toPomodoro);
+      } catch (err) {
+        console.error("Error toggling timer mode:", err);
+      }
     }
-    const elapsedSecs = Math.round(elapsedMs / 1000);
+  };
 
-    if (isStopwatchMode) {
-      setStopwatchSeconds(elapsedSecs);
-      setTimeLeft(pomodoroMinutes * 60);
-    } else {
-      setStopwatchSeconds(0);
-      setTimeLeft(Math.max(0, pomodoroMinutes * 60 - elapsedSecs));
+  const handleUpdatePomodoroMinutes = async (mins: number) => {
+    if (isRunning) return;
+    let val = mins;
+    if (val < 1) val = 1;
+    if (val > 1440) val = 1440; // Max 24 hours
+    setPomodoroMinutes(val);
+    localStorage.setItem("life_os_pomodoro_minutes", JSON.stringify(val));
+    if (currentUser) {
+      const username = getUsernameFromEmail(currentUser.email);
+      await saveTimerSettings(username, {
+        timerDurationMinutes: val
+      });
     }
-  }, [activeTimerData, optimisticState, myStatusNode, pomodoroMinutes, tasks, now]);
+  };
+
+  const handleUpdateBreakMinutes = async (mins: number) => {
+    if (isRunning) return;
+    let val = mins;
+    if (val < 1) val = 1;
+    if (val > 1440) val = 1440;
+    setBreakMinutes(val);
+    localStorage.setItem("life_os_break_minutes", JSON.stringify(val));
+    if (currentUser) {
+      const username = getUsernameFromEmail(currentUser.email);
+      await saveTimerSettings(username, {
+        stopwatchBreakDurationMinutes: val
+      });
+    }
+  };
 
   // Start / Pause timer
   const handleStartPause = async () => {
-    if (!currentUser) return;
+    // Check daily focus limit and session limit
+    if (!isRunning) {
+      if (todayCompletedSeconds >= 72000) {
+        setLimitAlertMessage("⚠️ Daily focus limit of 20 hours reached! Timer cannot be started.");
+        setShowLimitAlert(true);
+        return;
+      }
+      const accumulatedMs = currentUser
+        ? (myStatusNode?.active_timer?.accumulatedFocusMs || 0)
+        : safeParse(localStorage.getItem("life_os_accumulated_time"), 0);
+      const accumulatedSecs = Math.round(accumulatedMs / 1000);
+      if (accumulatedSecs >= 21600) {
+        setLimitAlertMessage("⚠️ Session focus limit of 6 hours reached! Resuming this session would exceed the limit. Please start a new session.");
+        setShowLimitAlert(true);
+        return;
+      }
+    }
+
+    if (!currentUser) {
+      // Offline start/pause fallback using local storage resume markers
+      const running = localStorage.getItem("life_os_timer_is_running") === "true";
+      const nextRunning = !running;
+
+      const savedSecs = localStorage.getItem("life_os_stopwatch_seconds");
+      let currentStopwatchSecs = safeParse(savedSecs, 0);
+
+      let lastResume = null;
+      let accumulated = 0;
+
+      if (nextRunning) {
+        lastResume = Date.now();
+        const savedAccumulated = localStorage.getItem("life_os_accumulated_time");
+        accumulated = safeParse(savedAccumulated, currentStopwatchSecs * 1000);
+        localStorage.setItem("life_os_last_resume_time", JSON.stringify(lastResume));
+        localStorage.setItem("life_os_accumulated_time", JSON.stringify(accumulated));
+      } else {
+        const savedLastResume = localStorage.getItem("life_os_last_resume_time");
+        const savedAccumulated = localStorage.getItem("life_os_accumulated_time");
+        if (savedLastResume) {
+          const lastResumeVal = safeParse(savedLastResume, 0);
+          const savedAccumVal = safeParse(savedAccumulated, 0);
+          if (lastResumeVal > 0) {
+            const elapsedMs = Date.now() - lastResumeVal;
+            accumulated = savedAccumVal + elapsedMs;
+            currentStopwatchSecs = Math.round(accumulated / 1000);
+          }
+        }
+        localStorage.setItem("life_os_last_resume_time", "null");
+        localStorage.setItem("life_os_accumulated_time", JSON.stringify(accumulated));
+        localStorage.setItem("life_os_stopwatch_seconds", JSON.stringify(currentStopwatchSecs));
+      }
+
+      localStorage.setItem("life_os_timer_is_running", JSON.stringify(nextRunning));
+      setLocalIsRunning(nextRunning);
+      window.dispatchEvent(new Event("life_os_timer_changed"));
+      return;
+    }
     const username = getUsernameFromEmail(currentUser.email);
     const activeTask = tasks.find(t => t.id === selectedTaskId);
     const taskTitle = activeTask ? activeTask.title : "General Focus Session";
@@ -552,7 +853,7 @@ export default function TimerView({
         taskTitle: taskTitle
       });
 
-      await startWebSession(username, taskTitle, activeTag, !isPomodoro).catch((err: any) => {
+      await startWebSession(username, taskTitle, activeTag, !isPomodoro, isPomodoro ? pomodoroMinutes : undefined).catch((err: any) => {
         console.error("Start session failed:", err);
         setOptimisticState(null);
       });
@@ -561,16 +862,54 @@ export default function TimerView({
 
   // Complete session automatically
   const handleTimerComplete = async () => {
-    if (!currentUser) return;
+    if (!currentUser) {
+      // Offline complete fallback
+      const activeTask = tasks.find(t => t.id === selectedTaskId);
+      const defaultTaskTitle = activeTask ? activeTask.title : "General Focus Session";
+      const startTime = new Date(Date.now() - pomodoroMinutes * 60 * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      onTriggerSaveModal?.({
+        elapsedSecs: pomodoroMinutes * 60,
+        defaultTaskTitle,
+        defaultTag: activeTag,
+        defaultNotes: "Pomodoro session completed",
+        startTime,
+        isPomodoro: true
+      });
+      return;
+    }
     const username = getUsernameFromEmail(currentUser.email);
+    const status = activeTimerData?.status || "RELAXING";
 
     setSessionNotes("");
 
-    await endWebSession(username).catch((err: any) => console.error("End session failed:", err));
+    if (status === "BREAK") {
+      // Break session completed
+      if (autoStartPomo) {
+        const activeTask = tasks.find(t => t.id === selectedTaskId);
+        const taskTitle = activeTask ? activeTask.title : "General Focus";
+        await startWebSession(username, taskTitle, activeTag, false, pomodoroMinutes).catch((err: any) => console.error("Start auto pomo failed:", err));
+      } else if (autoStartStopwatchAfterBreak) {
+        const activeTask = tasks.find(t => t.id === selectedTaskId);
+        const taskTitle = activeTask ? activeTask.title : "General Focus";
+        await startWebSession(username, taskTitle, activeTag, true).catch((err: any) => console.error("Start auto stopwatch failed:", err));
+      } else {
+        await endWebSession(username).catch((err: any) => console.error("End break failed:", err));
+      }
+    } else {
+      // Focus session completed
+      await endWebSession(username).catch((err: any) => console.error("End session failed:", err));
+      if (autoStartBreak) {
+        await startWebBreak(username, breakMinutes).catch((err: any) => console.error("Start auto break failed:", err));
+      }
+    }
     
     // Play sound notification using AudioContext
     try {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
       osc.connect(gain);
@@ -585,7 +924,59 @@ export default function TimerView({
 
   // Skip or stop stopwatch manually and log
   const handleSkipStop = async () => {
-    if (!currentUser) return;
+    if (!currentUser) {
+      // Offline stop fallback
+      const running = localStorage.getItem("life_os_timer_is_running") === "true";
+      const isPom = localStorage.getItem("life_os_is_pomodoro") === "true";
+      let currentSeconds = 0;
+
+      if (isPom) {
+        const storedTimeLeftVal = localStorage.getItem("life_os_timer_left");
+        const timeLeftVal = safeParse(storedTimeLeftVal, 25 * 60);
+        currentSeconds = pomodoroMinutes * 60 - timeLeftVal;
+      } else {
+        const savedSecs = localStorage.getItem("life_os_stopwatch_seconds");
+        currentSeconds = safeParse(savedSecs, 0);
+
+        if (running) {
+          const savedLastResume = localStorage.getItem("life_os_last_resume_time");
+          const savedAccumulated = localStorage.getItem("life_os_accumulated_time");
+          if (savedLastResume) {
+            const lastResumeVal = safeParse(savedLastResume, 0);
+            const savedAccumVal = safeParse(savedAccumulated, 0);
+            if (lastResumeVal > 0) {
+              const elapsedMs = Date.now() - lastResumeVal;
+              currentSeconds = Math.round((savedAccumVal + elapsedMs) / 1000);
+            }
+          }
+        }
+      }
+
+      if (currentSeconds <= 0 && !running) {
+        // Just reset
+        localStorage.setItem("life_os_timer_is_running", "false");
+        localStorage.setItem("life_os_stopwatch_seconds", "0");
+        localStorage.setItem("life_os_last_resume_time", "null");
+        localStorage.setItem("life_os_accumulated_time", "0");
+        setLocalIsRunning(false);
+        window.dispatchEvent(new Event("life_os_timer_changed"));
+        return;
+      }
+
+      const activeTask = tasks.find(t => t.id === selectedTaskId);
+      const defaultTaskTitle = activeTask ? activeTask.title : "General Focus Session";
+      const startTime = new Date(Date.now() - currentSeconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      onTriggerSaveModal?.({
+        elapsedSecs: currentSeconds,
+        defaultTaskTitle,
+        defaultTag: activeTag,
+        defaultNotes: isPom ? "Pomodoro session log" : "Stopwatch log",
+        startTime,
+        isPomodoro: isPom
+      });
+      return;
+    }
     const username = getUsernameFromEmail(currentUser.email);
     const activeTask = tasks.find(t => t.id === selectedTaskId);
     const taskTitle = activeTask ? activeTask.title : "General Focus Session";
@@ -617,6 +1008,13 @@ export default function TimerView({
     });
     setSessionNotes("");
   };
+
+  // Monitor Pomodoro countdown completion
+  useEffect(() => {
+    if (isPomodoro && isRunning && timeLeft === 0) {
+      handleTimerComplete();
+    }
+  }, [isPomodoro, isRunning, timeLeft]);
 
   // Set random quote when entering immersive mode, and rotate it every 30 seconds
   useEffect(() => {
@@ -679,11 +1077,6 @@ export default function TimerView({
   }, [isImmersive]);
 
   const activeTask = tasks.find(t => t.id === selectedTaskId);
-  
-  // Calculate today's completed focus records seconds
-  const todayCompletedSeconds = focusRecords
-    .filter(isRecordToday)
-    .reduce((acc, r) => acc + (r.durationSeconds || r.durationMinutes * 60), 0);
 
   // Current active session's seconds (live)
   const currentSessionSeconds = isPomodoro 
@@ -699,9 +1092,20 @@ export default function TimerView({
       ...myStatusNode,
       active_timer: activeTimerData
     };
-    myTotalFocusSeconds = getTodayFocusSecondsForUser(overriddenNode);
+    myTotalFocusSeconds = getFilteredFocusSecondsForUser(overriddenNode, selectedFilter);
   } else {
-    myTotalFocusSeconds = Math.min(20 * 3600, totalFocusSeconds);
+    // Offline user focus records fallback
+    let cutoffTime = 0;
+    if (selectedFilter === "7 Days") {
+      cutoffTime = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    } else if (selectedFilter === "30 Days") {
+      cutoffTime = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    }
+    const completedSecs = focusRecords.reduce((sum, r) => {
+      if (cutoffTime > 0 && r.timestamp < cutoffTime) return sum;
+      return sum + (r.durationSeconds || (r.durationMinutes * 60) || 0);
+    }, 0);
+    myTotalFocusSeconds = completedSecs + (selectedFilter === "Today" ? currentSessionSeconds : 0);
   }
 
   // Construct our real-time/mock friends list
@@ -715,7 +1119,7 @@ export default function TimerView({
     status: isRunning ? "Focusing" : "Idle",
     task: activeTask ? activeTask.title : "General Focus Session",
     emoji: myEmoji,
-    time: formatSecondsToDetailed(myTotalFocusSeconds),
+    time: formatSecondsForLeaderboard(myTotalFocusSeconds, selectedFilter),
     focusSeconds: myTotalFocusSeconds,
     isReal: !!currentUser,
     isMe: true
@@ -758,8 +1162,8 @@ export default function TimerView({
               task = "Chilling";
             }
             
-            // Compute their total focus seconds for today (both completed records + current active session time)
-            const totalSecs = getTodayFocusSecondsForUser(info);
+            // Compute their total focus seconds for selected filter
+            const totalSecs = getFilteredFocusSecondsForUser(info, selectedFilter);
             
             return {
               name: info.nickname || info.displayName || username,
@@ -767,7 +1171,7 @@ export default function TimerView({
               status: status,
               task: task,
               emoji: info.emoji || defaultEmoji,
-              time: formatSecondsToDetailed(totalSecs),
+              time: formatSecondsForLeaderboard(totalSecs, selectedFilter),
               focusSeconds: totalSecs,
               isReal: true,
               isMe: false
@@ -782,8 +1186,8 @@ export default function TimerView({
           status: "Focusing", 
           task: "Kubernetes Orchestration", 
           emoji: "🚀", 
-          time: formatSecondsToDetailed(Math.round((Date.now() - mockStartTimes.current.madhavan) / 1000)), 
-          focusSeconds: Math.round((Date.now() - mockStartTimes.current.madhavan) / 1000),
+          time: formatSecondsForLeaderboard(Math.round((Date.now() - mockStartTimes.current.madhavan) / 1000) * (selectedFilter === "7 Days" ? 6 : selectedFilter === "30 Days" ? 22 : selectedFilter === "All Time" ? 48 : 1), selectedFilter), 
+          focusSeconds: Math.round((Date.now() - mockStartTimes.current.madhavan) / 1000) * (selectedFilter === "7 Days" ? 6 : selectedFilter === "30 Days" ? 22 : selectedFilter === "All Time" ? 48 : 1),
           isReal: false,
           isMe: false
         },
@@ -793,8 +1197,8 @@ export default function TimerView({
           status: "Paused", 
           task: "Designing UI Wireframes", 
           emoji: "⏸️", 
-          time: formatSecondsToDetailed(1080), 
-          focusSeconds: 1080,
+          time: formatSecondsForLeaderboard(1080 * (selectedFilter === "7 Days" ? 5 : selectedFilter === "30 Days" ? 18 : selectedFilter === "All Time" ? 35 : 1), selectedFilter), 
+          focusSeconds: 1080 * (selectedFilter === "7 Days" ? 5 : selectedFilter === "30 Days" ? 18 : selectedFilter === "All Time" ? 35 : 1),
           isReal: false,
           isMe: false
         },
@@ -804,7 +1208,7 @@ export default function TimerView({
           status: "On Break", 
           task: "Coffee & Stretch", 
           emoji: "☕", 
-          time: "0s", 
+          time: formatSecondsForLeaderboard(0, selectedFilter), 
           focusSeconds: 0,
           isReal: false,
           isMe: false
@@ -908,6 +1312,39 @@ export default function TimerView({
       setManualSubmitStatus({ type: "error", message: "Please enter a valid positive number of minutes." });
       return;
     }
+
+    // Filter focus records for today's manual entries
+    const todayManualRecords = focusRecords.filter(r => isRecordToday(r) && (r.isManual || r.startTime === "" || r.endTime === ""));
+
+    if (todayManualRecords.length >= 3) {
+      setManualSubmitStatus({
+        type: "error",
+        message: "⚠️ Limit Exceeded: You can only submit a maximum of 3 manual entries per day."
+      });
+      return;
+    }
+
+    const todayManualMinsSum = todayManualRecords.reduce((sum, r) => sum + r.durationMinutes, 0);
+    if (todayManualMinsSum + mins > 240) {
+      const remaining = Math.max(0, 240 - todayManualMinsSum);
+      setManualSubmitStatus({
+        type: "error",
+        message: `⚠️ Limit Exceeded: Daily manual focus limit is 4 hours (240 minutes). You have logged ${todayManualMinsSum} minutes manually today. Remaining limit: ${remaining} minutes.`
+      });
+      return;
+    }
+
+    const todayTotalSecs = todayCompletedSeconds + (mins * 60);
+    if (todayTotalSecs > 72000) {
+      const remainingSecs = Math.max(0, 72000 - todayCompletedSeconds);
+      const remainingMins = Math.floor(remainingSecs / 60);
+      setManualSubmitStatus({
+        type: "error",
+        message: `⚠️ Limit Exceeded: Daily focus limit is 20 hours (1200 minutes). You have already focused for ${Math.round(todayCompletedSeconds / 60)} minutes today. Your remaining limit is ${remainingMins} minutes.`
+      });
+      return;
+    }
+
     if (!manualReason.trim()) {
       setManualSubmitStatus({ type: "error", message: "Please enter a reason for the manual entry." });
       return;
@@ -951,8 +1388,34 @@ export default function TimerView({
             <Maximize2 className="h-4 w-4" />
           </button>
 
+          {/* Mode Switcher Segmented Control */}
+          <div className="flex items-center gap-1 p-1 bg-gray-950 border border-gray-800 rounded-xl mb-4 relative z-10">
+            <button
+              onClick={() => handleToggleMode(true)}
+              disabled={isRunning}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                isPomodoro
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-gray-500 hover:text-gray-300 disabled:opacity-50"
+              }`}
+            >
+              Pomodoro
+            </button>
+            <button
+              onClick={() => handleToggleMode(false)}
+              disabled={isRunning}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                !isPomodoro
+                  ? "bg-blue-600 text-white shadow-sm"
+                  : "text-gray-500 hover:text-gray-300 disabled:opacity-50"
+              }`}
+            >
+              Stopwatch
+            </button>
+          </div>
+
           {/* Core Radial Timer Layout */}
-          <div className="relative flex items-center justify-center w-56 h-56 mb-8 mt-6">
+          <div className="relative flex items-center justify-center w-56 h-56 mb-8 mt-2">
             <svg className="w-full h-full transform -rotate-90">
               {/* Outer orbit backgound */}
               <circle
@@ -982,7 +1445,7 @@ export default function TimerView({
             {/* Inner text timer */}
             <div className="absolute inset-0 flex flex-col items-center justify-center space-y-1">
               <span className="font-sans text-4xl font-bold tracking-tight text-white">
-                {formatTime(elapsed)}
+                {formatTime(isPomodoro ? timeLeft : stopwatchSeconds)}
               </span>
               <span className="text-[10px] text-gray-500 uppercase tracking-widest font-semibold">
                 {isRunning ? "Focusing" : (hasStarted ? "Paused" : "Idle")}
@@ -1067,6 +1530,209 @@ export default function TimerView({
                 onChange={(e) => setSessionNotes(e.target.value)}
                 className="bg-transparent text-xs text-gray-200 focus:outline-none w-full font-medium"
               />
+            </div>
+          </div>
+        </div>
+
+        {/* Pomodoro Configuration Card */}
+        <div className="bg-gray-900/40 border border-gray-800 p-5 rounded-2xl space-y-4">
+          <div className="flex items-center gap-2 border-b border-gray-800 pb-2">
+            <Sliders className="h-4 w-4 text-blue-400" />
+            <h3 className="text-xs font-bold uppercase tracking-widest text-gray-400">
+              Pomodoro Configurations
+            </h3>
+          </div>
+          
+          {/* Presets */}
+          <div className="space-y-2">
+            <label className="text-[10px] text-gray-500 font-bold uppercase tracking-wider">Presets</label>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { fMins: 25, bMins: 5, label: "25/5 Sprint" },
+                { fMins: 50, bMins: 10, label: "50/10 Sprint" },
+                { fMins: 15, bMins: 3, label: "15/3 Lite" }
+              ].map(({ fMins, bMins, label }) => {
+                const isSelected = pomodoroMinutes === fMins && breakMinutes === bMins;
+                return (
+                  <button
+                    key={label}
+                    onClick={async () => {
+                      setPomodoroMinutes(fMins);
+                      setBreakMinutes(bMins);
+                      localStorage.setItem("life_os_pomodoro_minutes", JSON.stringify(fMins));
+                      localStorage.setItem("life_os_break_minutes", JSON.stringify(bMins));
+                      if (currentUser) {
+                        const myUsername = getUsernameFromEmail(currentUser.email);
+                        await saveTimerSettings(myUsername, {
+                          timerDurationMinutes: fMins,
+                          stopwatchBreakDurationMinutes: bMins
+                        });
+                      }
+                    }}
+                    className={`h-9 rounded-xl border text-[11px] font-bold transition-all cursor-pointer ${
+                      isSelected 
+                        ? "bg-blue-600/15 border-blue-500 text-blue-400" 
+                        : "bg-gray-950 border-gray-850 text-gray-400 hover:text-gray-250"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Custom Durations */}
+          <div className="grid grid-cols-2 gap-4 pt-1">
+            <div className="space-y-1 text-left">
+              <label className="text-[10px] text-gray-500 font-bold uppercase tracking-wider block">
+                Focus Duration (mins)
+              </label>
+              <div className="flex items-center gap-1.5 bg-gray-950 border border-gray-850 p-1.5 rounded-xl font-sans">
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => handleUpdatePomodoroMinutes(pomodoroMinutes - 1)}
+                  className="w-7 h-7 flex items-center justify-center bg-gray-900 hover:bg-gray-800 rounded-lg text-gray-400 hover:text-white border border-gray-800 disabled:opacity-45 cursor-pointer font-bold text-sm"
+                >
+                  -
+                </button>
+                <input
+                  type="number"
+                  min="1"
+                  max="1440"
+                  value={pomodoroMinutes}
+                  onChange={(e) => handleUpdatePomodoroMinutes(parseInt(e.target.value) || 25)}
+                  disabled={isRunning}
+                  className="w-full bg-transparent text-center text-xs font-bold text-white focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                />
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => handleUpdatePomodoroMinutes(pomodoroMinutes + 1)}
+                  className="w-7 h-7 flex items-center justify-center bg-gray-900 hover:bg-gray-800 rounded-lg text-gray-400 hover:text-white border border-gray-800 disabled:opacity-45 cursor-pointer font-bold text-sm"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1 text-left">
+              <label className="text-[10px] text-gray-500 font-bold uppercase tracking-wider block">
+                Break Duration (mins)
+              </label>
+              <div className="flex items-center gap-1.5 bg-gray-950 border border-gray-850 p-1.5 rounded-xl font-sans">
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => handleUpdateBreakMinutes(breakMinutes - 1)}
+                  className="w-7 h-7 flex items-center justify-center bg-gray-900 hover:bg-gray-800 rounded-lg text-gray-400 hover:text-white border border-gray-800 disabled:opacity-45 cursor-pointer font-bold text-sm"
+                >
+                  -
+                </button>
+                <input
+                  type="number"
+                  min="1"
+                  max="1440"
+                  value={breakMinutes}
+                  onChange={(e) => handleUpdateBreakMinutes(parseInt(e.target.value) || 5)}
+                  disabled={isRunning}
+                  className="w-full bg-transparent text-center text-xs font-bold text-white focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                />
+                <button
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => handleUpdateBreakMinutes(breakMinutes + 1)}
+                  className="w-7 h-7 flex items-center justify-center bg-gray-900 hover:bg-gray-800 rounded-lg text-gray-400 hover:text-white border border-gray-800 disabled:opacity-45 cursor-pointer font-bold text-sm"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {isRunning && (
+            <div className="text-[10px] text-amber-500/90 font-medium flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 px-3 py-2 rounded-xl text-left leading-relaxed">
+              <AlertTriangle className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+              <span>Timing presets, custom durations, and timer mode are locked during an active focus session.</span>
+            </div>
+          )}
+
+          {/* Auto-Start Toggles */}
+          <div className="space-y-2.5 pt-1">
+            <label className="text-[10px] text-gray-500 font-bold uppercase tracking-wider">Auto-Start Options</label>
+            <div className="space-y-2">
+              {/* Auto Start Break */}
+              <div className="flex items-center justify-between p-2.5 bg-gray-950/60 border border-gray-850 rounded-xl">
+                <div className="flex flex-col text-left">
+                  <span className="text-xs text-gray-300 font-medium">Auto-Start Break</span>
+                  <span className="text-[9px] text-gray-500">Automatically transitions to break phase after focus ends.</span>
+                </div>
+                <button
+                  onClick={async () => {
+                    const nextVal = !autoStartBreak;
+                    setAutoStartBreak(nextVal);
+                    localStorage.setItem("life_os_auto_start_break", JSON.stringify(nextVal));
+                    if (currentUser) {
+                      const myUsername = getUsernameFromEmail(currentUser.email);
+                      await saveTimerSettings(myUsername, { autoStartBreak: nextVal });
+                    }
+                  }}
+                  className={`w-9 h-5 flex items-center rounded-full p-0.5 cursor-pointer transition-all ${
+                    autoStartBreak ? "bg-blue-600 justify-end" : "bg-gray-800 justify-start"
+                  }`}
+                >
+                  <span className="w-4 h-4 bg-white rounded-full shadow-md" />
+                </button>
+              </div>
+
+              {/* Auto Start Focus */}
+              <div className="flex items-center justify-between p-2.5 bg-gray-950/60 border border-gray-850 rounded-xl">
+                <div className="flex flex-col text-left">
+                  <span className="text-xs text-gray-300 font-medium">Auto-Start Focus</span>
+                  <span className="text-[9px] text-gray-500">Automatically begins next focus session when break completes.</span>
+                </div>
+                <button
+                  onClick={async () => {
+                    const nextVal = !autoStartPomo;
+                    setAutoStartPomo(nextVal);
+                    localStorage.setItem("life_os_auto_start_pomo", JSON.stringify(nextVal));
+                    if (currentUser) {
+                      const myUsername = getUsernameFromEmail(currentUser.email);
+                      await saveTimerSettings(myUsername, { autoStartPomo: nextVal });
+                    }
+                  }}
+                  className={`w-9 h-5 flex items-center rounded-full p-0.5 cursor-pointer transition-all ${
+                    autoStartPomo ? "bg-blue-600 justify-end" : "bg-gray-800 justify-start"
+                  }`}
+                >
+                  <span className="w-4 h-4 bg-white rounded-full shadow-md" />
+                </button>
+              </div>
+
+              {/* Auto Start Stopwatch */}
+              <div className="flex items-center justify-between p-2.5 bg-gray-950/60 border border-gray-850 rounded-xl">
+                <div className="flex flex-col text-left">
+                  <span className="text-xs text-gray-300 font-medium">Auto-Start Stopwatch After Break</span>
+                  <span className="text-[9px] text-gray-500">Automatically launches stopwatch mode when break ends.</span>
+                </div>
+                <button
+                  onClick={async () => {
+                    const nextVal = !autoStartStopwatchAfterBreak;
+                    setAutoStartStopwatchAfterBreak(nextVal);
+                    localStorage.setItem("life_os_auto_start_sw_after_break", JSON.stringify(nextVal));
+                    if (currentUser) {
+                      const myUsername = getUsernameFromEmail(currentUser.email);
+                      await saveTimerSettings(myUsername, { autoStartStopwatchAfterBreak: nextVal });
+                    }
+                  }}
+                  className={`w-9 h-5 flex items-center rounded-full p-0.5 cursor-pointer transition-all ${
+                    autoStartStopwatchAfterBreak ? "bg-blue-600 justify-end" : "bg-gray-800 justify-start"
+                  }`}
+                >
+                  <span className="w-4 h-4 bg-white rounded-full shadow-md" />
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1174,6 +1840,23 @@ export default function TimerView({
             <span className="text-[10px] text-gray-500 font-bold px-1.5 py-0.5 bg-gray-950 rounded border border-gray-800">
               Live
             </span>
+          </div>
+
+          {/* Premium Period Filter Tab switcher */}
+          <div className="flex items-center gap-1 p-1 bg-gray-950 border border-gray-800/50 rounded-xl">
+            {(["Today", "7 Days", "30 Days", "All Time"] as const).map((filter) => (
+              <button
+                key={filter}
+                onClick={() => setSelectedFilter(filter)}
+                className={`flex-1 text-[9px] font-bold py-1 px-1.5 rounded-lg transition-all cursor-pointer ${
+                  selectedFilter === filter
+                    ? "bg-blue-600 text-white shadow-sm"
+                    : "text-gray-500 hover:text-gray-300"
+                }`}
+              >
+                {filter === "Today" ? "Today" : filter === "7 Days" ? "7D" : filter === "30 Days" ? "30D" : "All"}
+              </button>
+            ))}
           </div>
 
           <div className="space-y-3">
@@ -1309,7 +1992,7 @@ export default function TimerView({
                           alt={member.name}
                         />
                       ) : (
-                        <span>{member.emoji}</span>
+                        <span className="flex items-center justify-center leading-none select-none">{member.emoji}</span>
                       )}
                       <span className="absolute -bottom-0.5 -right-0.5 flex h-2 w-2">
                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
@@ -1362,7 +2045,7 @@ export default function TimerView({
                       className="space-y-1"
                     >
                       <span className="text-[10px] text-blue-400 font-mono uppercase tracking-widest font-bold">
-                        STOPWATCH
+                        {isPomodoro ? "POMODORO" : "STOPWATCH"}
                       </span>
                       <h1 className="text-2xl font-display font-bold tracking-tight text-white truncate max-w-sm">
                         {activeTask ? activeTask.title : "Deep focus session active..."}
@@ -1374,7 +2057,7 @@ export default function TimerView({
 
               {/* Massive ambient countdown timer (Always shown, completely stable and static, no blink) */}
               <div className="text-8xl md:text-9xl font-sans font-bold tracking-wider text-white py-4 select-none leading-none">
-                {formatTime(elapsed)}
+                {formatTime(isPomodoro ? timeLeft : stopwatchSeconds)}
               </div>
 
               {/* Motivational Quote (Always shown under the timer) */}
@@ -1422,6 +2105,45 @@ export default function TimerView({
               </div>
             </div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Daily limit warning modal */}
+      <AnimatePresence>
+        {showLimitAlert && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowLimitAlert(false)}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-gray-950 border border-red-500/30 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl relative z-10 text-center"
+            >
+              <div className="mx-auto w-12 h-12 bg-red-500/10 border border-red-500/20 text-red-500 rounded-full flex items-center justify-center">
+                <AlertTriangle className="h-6 w-6 animate-pulse" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-sm font-extrabold uppercase tracking-wider text-red-400">
+                  Focus Limit Reached
+                </h3>
+                <p className="text-xs text-gray-400 leading-relaxed font-medium">
+                  {limitAlertMessage || "Daily focus limit of 20 hours (1200 minutes) has been reached. Timer has been paused."}
+                </p>
+              </div>
+              <button
+                onClick={() => setShowLimitAlert(false)}
+                className="w-full py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-bold transition-all cursor-pointer shadow-lg shadow-red-600/10"
+              >
+                Understood
+              </button>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
     </div>

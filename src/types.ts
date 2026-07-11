@@ -107,6 +107,7 @@ export interface FocusRecord {
   startTime: string; // HH:MM
   endTime: string; // HH:MM
   timestamp: number;
+  isManual?: boolean;
 }
 
 export interface KeepNote {

@@ -582,7 +582,44 @@ export const listenToTodayStats = (username: string, callback: (data: any) => vo
   };
 };
 
+export const listenToTimerSettings = (username: string, callback: (data: any) => void): (() => void) => {
+  if (!username) return () => {};
+  const settingsRef = ref(database, `users/${username}/timer_settings`);
+  const onValueCallback = (snapshot: DataSnapshot) => {
+    callback(snapshot.exists() ? snapshot.val() : null);
+  };
+  onValue(settingsRef, onValueCallback);
+  return () => {
+    off(settingsRef, "value", onValueCallback);
+  };
+};
+
+export const saveTimerSettings = async (username: string, settings: {
+  timerDurationMinutes?: number;
+  stopwatchBreakDurationMinutes?: number;
+  autoStartBreak?: boolean;
+  autoStartPomo?: boolean;
+  autoStartStopwatchAfterBreak?: boolean;
+}) => {
+  if (!username) return;
+  const settingsRef = ref(database, `users/${username}/timer_settings`);
+  await update(settingsRef, settings).catch(err => {
+    console.error("Error saving timer settings to Firebase:", err);
+  });
+};
+
+
 // One-time profile fetcher
+export const toggleWebSessionMode = async (username: string, toPomodoro: boolean) => {
+  if (!username) return;
+  const timerRef = ref(database, `users/${username}/active_timer`);
+  await update(timerRef, {
+    isStopwatchMode: !toPomodoro,
+    mode: toPomodoro ? "POMODORO" : "STOPWATCH",
+    lastUpdatedTimestamp: Date.now()
+  });
+};
+
 export const fetchUserProfile = async (username: string): Promise<any> => {
   if (!username) return null;
   const userRef = ref(database, `users/${username}`);
@@ -591,7 +628,7 @@ export const fetchUserProfile = async (username: string): Promise<any> => {
 };
 
 // Thin-Client Transactions
-export const startWebSession = async (username: string, taskTitle: string, tag: string, isStopwatchMode?: boolean) => {
+export const startWebSession = async (username: string, taskTitle: string, tag: string, isStopwatchMode?: boolean, durationMinutes?: number) => {
   if (!username) return;
   const timerRef = ref(database, `users/${username}/active_timer`);
   await runTransaction(timerRef, (currentData) => {
@@ -599,13 +636,44 @@ export const startWebSession = async (username: string, taskTitle: string, tag: 
     const prevAccumulated = currentData && currentData.accumulatedFocusMs ? currentData.accumulatedFocusMs : 0;
     return {
       status: "FOCUSING",
+      mode: isStopwatchMode ? "STOPWATCH" : "POMODORO",
+      isStopwatchMode: !!isStopwatchMode,
       startTimeMs: now,
       accumulatedFocusMs: prevAccumulated,
       taskTitle: taskTitle || "General Focus",
       tag: tag || "Study",
-      isStopwatchMode: !!isStopwatchMode,
+      targetEndTimeMs: (!isStopwatchMode && durationMinutes) ? (now + durationMinutes * 60 * 1000) : 0,
       lastUpdatedTimestamp: now
     };
+  });
+};
+
+export const startWebBreak = async (username: string, durationMinutes: number) => {
+  if (!username) return;
+  const timerRef = ref(database, `users/${username}/active_timer`);
+  await runTransaction(timerRef, (currentData) => {
+    const now = Date.now();
+    return {
+      status: "BREAK",
+      mode: "POMODORO",
+      isStopwatchMode: false,
+      startTimeMs: now,
+      accumulatedFocusMs: currentData?.accumulatedFocusMs || 0,
+      accumulatedBreakMs: 0,
+      taskTitle: "Taking a Break",
+      tag: "Break",
+      targetEndTimeMs: now + (durationMinutes * 60 * 1000),
+      lastUpdatedTimestamp: now
+    };
+  });
+};
+
+export const updateTimerTaskAndTag = async (username: string, taskTitle: string, tag: string) => {
+  if (!username) return;
+  const timerRef = ref(database, `users/${username}/active_timer`);
+  await update(timerRef, {
+    taskTitle: taskTitle || "General Focus",
+    tag: tag || "Study"
   });
 };
 
@@ -616,6 +684,8 @@ export const pauseWebSession = async (username: string) => {
     if (!currentData) {
       return {
         status: "BREAK",
+        mode: "POMODORO",
+        isStopwatchMode: false,
         startTimeMs: 0,
         accumulatedFocusMs: 0,
         taskTitle: "",
@@ -643,7 +713,7 @@ export const endWebSession = async (username: string) => {
   const timerRef = ref(database, `users/${username}/active_timer`);
   await runTransaction(timerRef, (currentData) => {
     const now = Date.now();
-    const tzOffset = new Date().getTimezoneOffset();
+    const tzOffset = -new Date().getTimezoneOffset();
     
     let focusMs = 0;
     let breakMs = 0;
@@ -662,6 +732,8 @@ export const endWebSession = async (username: string) => {
     
     return {
       status: "RELAXING",
+      mode: currentData?.mode || "POMODORO",
+      isStopwatchMode: !!currentData?.isStopwatchMode,
       startTimeMs: 0,
       accumulatedFocusMs: focusMs,
       accumulatedBreakMs: breakMs,
@@ -730,160 +802,129 @@ export const listenToMyBell = (myUsername: string, onUpdate: (bellSignal: any) =
   return bellListenerUnsubscribe;
 };
 
-// Listen to my focus records in real-time from various possible nodes for maximal compatibility with Android client
+// Listen to my focus records in real-time from the canonical history_logs path
 export const listenToMyFocusRecords = (
   username: string, 
   onUpdate: (records: FocusRecord[]) => void
 ): (() => void) => {
   if (!username) return () => {};
 
-  const paths = [
-    `users/${username}/focusRecords`,
-    `users/${username}/focus_records`,
-    `users/${username}/history_logs`,
-    `focusRecords/${username}`,
-    `focus_records/${username}`
-  ];
-
-  const sourceRecordsMap = new Map<string, FocusRecord[]>();
-
-  const unsubscribes = paths.map((path) => {
-    const pathRef = ref(database, path);
-    const callback = (snapshot: DataSnapshot) => {
-      let mappedList: FocusRecord[] = [];
-      if (snapshot.exists()) {
-        try {
-          const data = snapshot.val();
-          let list: any[] = [];
-          if (Array.isArray(data)) {
-            list = data.filter(Boolean);
-          } else if (typeof data === "object") {
-            list = Object.keys(data).map(key => {
-              if (typeof data[key] === "object" && data[key] !== null) {
-                return { id: key, ...data[key] };
-              }
-              return null;
-            }).filter(Boolean);
-          }
-
-          mappedList = list.map((rec: any) => {
-            const ts = Number(rec.timestamp || rec.endTime || rec.startTime || Date.now());
-            
-            let startStr = "00:00";
-            if (rec.startTime) {
-              if (typeof rec.startTime === "number") {
-                startStr = new Date(rec.startTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-              } else {
-                startStr = String(rec.startTime);
-              }
+  const pathRef = ref(database, `users/${username}/history_logs`);
+  const callback = (snapshot: DataSnapshot) => {
+    let mappedList: FocusRecord[] = [];
+    if (snapshot.exists()) {
+      try {
+        const data = snapshot.val();
+        let list: any[] = [];
+        if (Array.isArray(data)) {
+          list = data.filter(Boolean);
+        } else if (typeof data === "object") {
+          list = Object.keys(data).map(key => {
+            if (typeof data[key] === "object" && data[key] !== null) {
+              return { id: key, ...data[key] };
             }
-
-            let endStr = "00:00";
-            if (rec.endTime) {
-              if (typeof rec.endTime === "number") {
-                endStr = new Date(rec.endTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-              } else {
-                endStr = String(rec.endTime);
-              }
-            }
-
-            const computedSecs = Number(
-              rec.durationSeconds || 
-              (rec.totalFocusTimeMs ? Math.round(rec.totalFocusTimeMs / 1000) : 0) || 
-              (rec.durationMinutes ? rec.durationMinutes * 60 : 0) || 
-              0
-            );
-
-            const computedMins = Number(
-              rec.durationMinutes || 
-              (rec.totalFocusTimeMs ? Math.round(rec.totalFocusTimeMs / 60000) : 0) || 
-              (rec.durationSeconds ? Math.round(rec.durationSeconds / 60) : 0) || 
-              0
-            );
-
-            return {
-              id: rec.id || String(ts || Math.random()),
-              taskTitle: rec.taskTitle || rec.title || rec.taskName || "Focus Session",
-              tag: rec.tag || rec.category || "Study",
-              notes: rec.notes || rec.description || "",
-              durationSeconds: computedSecs,
-              durationMinutes: computedMins,
-              dateString: rec.dateString || new Date(ts).toISOString().split("T")[0],
-              startTime: startStr,
-              endTime: endStr,
-              timestamp: ts
-            };
-          });
-        } catch (err) {
-          console.error(`Error parsing focus records from path ${path}:`, err);
+            return null;
+          }).filter(Boolean);
         }
-      }
 
-      // Update the list for this path
-      sourceRecordsMap.set(path, mappedList);
-
-      // Merge records from all active sources
-      const allMergedMap = new Map<string, FocusRecord>();
-      sourceRecordsMap.forEach((recordsList) => {
-        recordsList.forEach((rec) => {
-          if (rec && rec.id) {
-            allMergedMap.set(rec.id, rec);
+        mappedList = list.map((rec: any) => {
+          const ts = Number(rec.timestamp || rec.endTime || rec.startTime || Date.now());
+          
+          let startStr = "00:00";
+          if (rec.startTime) {
+            if (typeof rec.startTime === "number") {
+              startStr = new Date(rec.startTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+            } else {
+              startStr = String(rec.startTime);
+            }
           }
+
+          let endStr = "00:00";
+          if (rec.endTime) {
+            if (typeof rec.endTime === "number") {
+              endStr = new Date(rec.endTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+            } else {
+              endStr = String(rec.endTime);
+            }
+          }
+
+          const computedSecs = Number(
+            rec.durationSeconds || 
+            (rec.totalFocusTimeMs ? Math.round(rec.totalFocusTimeMs / 1000) : 0) || 
+            (rec.durationMinutes ? rec.durationMinutes * 60 : 0) || 
+            0
+          );
+
+          const computedMins = Number(
+            rec.durationMinutes || 
+            (rec.totalFocusTimeMs ? Math.round(rec.totalFocusTimeMs / 60000) : 0) || 
+            (rec.durationSeconds ? Math.round(rec.durationSeconds / 60) : 0) || 
+            0
+          );
+
+          return {
+            id: rec.id || String(ts || Math.random()),
+            taskTitle: rec.taskTitle || rec.title || rec.taskName || "Focus Session",
+            tag: rec.tag || rec.category || "Study",
+            notes: rec.notes || rec.description || "",
+            durationSeconds: computedSecs,
+            durationMinutes: computedMins,
+            dateString: rec.dateString || new Date(ts).toISOString().split("T")[0],
+            startTime: startStr,
+            endTime: endStr,
+            timestamp: ts,
+            isManual: !!(rec.isManual || rec.manual)
+          };
         });
-      });
-
-      const mergedList = Array.from(allMergedMap.values()).sort((a, b) => b.timestamp - a.timestamp);
-      onUpdate(mergedList);
-    };
-
-    onValue(pathRef, callback);
-    return () => off(pathRef, "value", callback);
-  });
-
-  return () => {
-    unsubscribes.forEach((unsub) => unsub());
+      } catch (err) {
+        console.error("Error parsing focus records from history_logs:", err);
+      }
+    }
+    const mergedList = mappedList.sort((a, b) => b.timestamp - a.timestamp);
+    onUpdate(mergedList);
   };
+
+  onValue(pathRef, callback);
+  return () => off(pathRef, "value", callback);
 };
 
-// Add a focus record to Firebase Realtime Database
+// Add a focus record directly to history_logs
 export const addFocusRecordToDb = async (username: string, record: FocusRecord) => {
   if (!username) return;
-  
-  // Write to all active locations for perfect 2-way client synchronization
-  const paths = [
-    `users/${username}/focusRecords/${record.id}`,
-    `users/${username}/focus_records/${record.id}`,
-    `focusRecords/${username}/${record.id}`,
-    `focus_records/${username}/${record.id}`
-  ];
-
-  await Promise.all(
-    paths.map(path => set(ref(database, path), record))
-  ).catch(err => {
-    console.error("Error multi-writing focus record:", err);
+  const path = `users/${username}/history_logs/${record.id}`;
+  const tzOffset = -new Date().getTimezoneOffset();
+  const dbRecord = {
+    taskTitle: record.taskTitle || "General Focus",
+    tag: record.tag || "Study",
+    notes: record.notes || "",
+    durationSeconds: Number(record.durationSeconds) || 0,
+    durationMinutes: Number(record.durationMinutes) || 0,
+    dateString: record.dateString || new Date(record.timestamp).toISOString().split("T")[0],
+    startTime: record.startTime || "00:00",
+    endTime: record.endTime || "00:00",
+    timestamp: Number(record.timestamp) || Date.now(),
+    totalFocusTimeMs: (Number(record.durationSeconds) || 0) * 1000,
+    totalBreakTimeMs: 0,
+    timezoneOffsetMinutes: tzOffset
+  };
+  await set(ref(database, path), dbRecord).catch(err => {
+    console.error("Error writing focus record to history_logs:", err);
   });
 };
 
-// Remove a focus record from Firebase Realtime Database
+// Remove a focus record from history_logs
 export const removeFocusRecordFromDb = async (username: string, recordId: string) => {
   if (!username) return;
-  const paths = [
-    `users/${username}/focusRecords/${recordId}`,
-    `users/${username}/focus_records/${recordId}`,
-    `focusRecords/${username}/${recordId}`,
-    `focus_records/${username}/${recordId}`
-  ];
-  await Promise.all(
-    paths.map(path => set(ref(database, path), null))
-  ).catch(err => {
-    console.error("Error multi-deleting focus record:", err);
+  const path = `users/${username}/history_logs/${recordId}`;
+  await set(ref(database, path), null).catch(err => {
+    console.error("Error deleting focus record:", err);
   });
 };
 
 /**
  * Submits a manual focus entry request to the user's thin-client queue.
  * Strictly uses Firebase push() to add an object:
- * { focusMinutes, reason, timestamp: serverTimestamp() }
+ * { focusMinutes, reason, timestamp: serverTimestamp(), timezoneOffsetMinutes }
  * to /users/{username}/manual_entry_requests
  */
 export const submitManualEntry = async (
@@ -899,7 +940,8 @@ export const submitManualEntry = async (
   await set(newEntryRef, {
     focusMinutes,
     reason,
-    timestamp: serverTimestamp()
+    timestamp: serverTimestamp(),
+    timezoneOffsetMinutes: -new Date().getTimezoneOffset()
   });
 };
 
