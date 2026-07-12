@@ -108,6 +108,7 @@ export interface FocusRecord {
   endTime: string; // HH:MM
   timestamp: number;
   isManual?: boolean;
+  mode?: "POMODORO" | "STOPWATCH" | string;
 }
 
 export interface KeepNote {

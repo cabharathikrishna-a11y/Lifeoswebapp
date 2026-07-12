@@ -101,6 +101,27 @@ export const auth = getAuth(app);
 export const database = getDatabase(app);
 export const storage = getStorage(app);
 
+// Server time offset synchronization for timezone & clock alignment between devices
+let serverTimeOffset = 0;
+if (typeof window !== "undefined") {
+  try {
+    const offsetRef = ref(database, ".info/serverTimeOffset");
+    onValue(offsetRef, (snapshot) => {
+      const val = snapshot.val();
+      if (typeof val === "number") {
+        serverTimeOffset = val;
+        console.log("[Firebase Server Time] Synchronized offset updated:", val, "ms");
+      }
+    });
+  } catch (err) {
+    console.error("[Firebase Server Time] Failed to register offset listener:", err);
+  }
+}
+
+export const getServerTime = (): number => {
+  return Date.now() + serverTimeOffset;
+};
+
 // -----------------------------------------------------------------------------
 // PROFILE IMAGE CACHING PROTOCOL (IndexedDB + localStorage)
 // -----------------------------------------------------------------------------
@@ -628,44 +649,126 @@ export const fetchUserProfile = async (username: string): Promise<any> => {
 };
 
 // Thin-Client Transactions
+const syncUserRootFromTimer = async (username: string, timerData: any) => {
+  if (!username || !timerData) return;
+  const userRootRef = ref(database, `users/${username}`);
+  await update(userRootRef, {
+    isFocusing: timerData.status === "FOCUSING",
+    focusStatus: timerData.status,
+    lastResumeTimeMs: timerData.status === "FOCUSING" ? timerData.startTimeMs : null,
+    accumulatedTimeMs: timerData.accumulatedFocusMs || 0,
+    isStopwatchMode: !!timerData.isStopwatchMode,
+    mode: timerData.mode || (timerData.isStopwatchMode ? "STOPWATCH" : "POMODORO"),
+    currentTaskTitle: timerData.taskTitle || null,
+    lastUpdatedTimestamp: getServerTime()
+  }).catch((err) => { console.error("syncUserRootFromTimer error:", err); });
+};
+
 export const startWebSession = async (username: string, taskTitle: string, tag: string, isStopwatchMode?: boolean, durationMinutes?: number) => {
   if (!username) return;
   const timerRef = ref(database, `users/${username}/active_timer`);
-  await runTransaction(timerRef, (currentData) => {
-    const now = Date.now();
-    const prevAccumulated = currentData && currentData.accumulatedFocusMs ? currentData.accumulatedFocusMs : 0;
+  const txResult = await runTransaction(timerRef, (currentData) => {
+    const now = getServerTime();
+    
+    // Check if we are resuming a paused session
+    if (currentData && (currentData.status === "PAUSED" || currentData.status === "BREAK")) {
+      const existingIsStopwatchMode = currentData.isStopwatchMode ?? !!isStopwatchMode;
+      const existingMode = currentData.mode || (existingIsStopwatchMode ? "STOPWATCH" : "POMODORO");
+      if (currentData.status === "BREAK") {
+        const focusMs = currentData.accumulatedFocusMs || 0;
+        return {
+          ...currentData,
+          status: "FOCUSING",
+          mode: existingMode,
+          isStopwatchMode: existingIsStopwatchMode,
+          startTimeMs: now,
+          targetEndTimeMs: (!existingIsStopwatchMode && durationMinutes) ? (now + Math.max(0, (durationMinutes * 60 * 1000) - focusMs)) : 0,
+          focusDurationMinutes: durationMinutes || null,
+          lastUpdatedTimestamp: now
+        };
+      }
+
+      const isBreak = currentData.pausedFromStatus === "BREAK";
+      const focusMs = currentData.accumulatedFocusMs || 0;
+      const breakMs = currentData.accumulatedBreakMs || 0;
+      
+      if (isBreak) {
+        // Resume break phase
+        const bMins = currentData.breakDurationMinutes || 5;
+        const breakDurationMs = bMins * 60 * 1000;
+        return {
+          ...currentData,
+          status: "BREAK",
+          mode: existingMode,
+          isStopwatchMode: existingIsStopwatchMode,
+          startTimeMs: now,
+          targetEndTimeMs: now + Math.max(0, breakDurationMs - breakMs),
+          lastUpdatedTimestamp: now
+        };
+      } else {
+        // Resume focus phase
+        const fMins = durationMinutes || 25;
+        const focusDurationMs = fMins * 60 * 1000;
+        return {
+          ...currentData,
+          status: "FOCUSING",
+          mode: existingMode,
+          isStopwatchMode: existingIsStopwatchMode,
+          startTimeMs: now,
+          targetEndTimeMs: (!existingIsStopwatchMode && durationMinutes) ? (now + Math.max(0, focusDurationMs - focusMs)) : 0,
+          focusDurationMinutes: durationMinutes || null,
+          lastUpdatedTimestamp: now
+        };
+      }
+    }
+    
+    // Otherwise, starting a completely brand-new session (reset focus accumulation to 0)
     return {
       status: "FOCUSING",
       mode: isStopwatchMode ? "STOPWATCH" : "POMODORO",
       isStopwatchMode: !!isStopwatchMode,
       startTimeMs: now,
-      accumulatedFocusMs: prevAccumulated,
+      accumulatedFocusMs: 0,
+      accumulatedBreakMs: 0,
       taskTitle: taskTitle || "General Focus",
       tag: tag || "Study",
       targetEndTimeMs: (!isStopwatchMode && durationMinutes) ? (now + durationMinutes * 60 * 1000) : 0,
+      focusDurationMinutes: durationMinutes || null,
       lastUpdatedTimestamp: now
     };
   });
+  if (txResult.committed && txResult.snapshot.exists()) {
+    await syncUserRootFromTimer(username, txResult.snapshot.val());
+  }
 };
 
-export const startWebBreak = async (username: string, durationMinutes: number) => {
+export const startWebBreak = async (username: string, durationMinutes: number, isStopwatchMode?: boolean) => {
   if (!username) return;
   const timerRef = ref(database, `users/${username}/active_timer`);
-  await runTransaction(timerRef, (currentData) => {
-    const now = Date.now();
+  const txResult = await runTransaction(timerRef, (currentData) => {
+    const now = getServerTime();
+    let focusMs = currentData?.accumulatedFocusMs || 0;
+    if (currentData?.status === "FOCUSING" && currentData?.startTimeMs) {
+      focusMs += (now - currentData.startTimeMs);
+    }
+    const finalIsStopwatch = currentData?.isStopwatchMode !== undefined ? currentData.isStopwatchMode : (isStopwatchMode ?? false);
     return {
       status: "BREAK",
-      mode: "POMODORO",
-      isStopwatchMode: false,
+      mode: finalIsStopwatch ? "STOPWATCH" : "POMODORO",
+      isStopwatchMode: finalIsStopwatch,
       startTimeMs: now,
-      accumulatedFocusMs: currentData?.accumulatedFocusMs || 0,
+      accumulatedFocusMs: focusMs,
       accumulatedBreakMs: 0,
       taskTitle: "Taking a Break",
       tag: "Break",
+      breakDurationMinutes: durationMinutes,
       targetEndTimeMs: now + (durationMinutes * 60 * 1000),
       lastUpdatedTimestamp: now
     };
   });
+  if (txResult.committed && txResult.snapshot.exists()) {
+    await syncUserRootFromTimer(username, txResult.snapshot.val());
+  }
 };
 
 export const updateTimerTaskAndTag = async (username: string, taskTitle: string, tag: string) => {
@@ -675,44 +778,53 @@ export const updateTimerTaskAndTag = async (username: string, taskTitle: string,
     taskTitle: taskTitle || "General Focus",
     tag: tag || "Study"
   });
+  const userRootRef = ref(database, `users/${username}`);
+  await update(userRootRef, {
+    currentTaskTitle: taskTitle || "General Focus"
+  }).catch((err) => { console.error("updateTimerTaskAndTag error:", err); });
 };
 
-export const pauseWebSession = async (username: string) => {
+export const pauseWebSession = async (username: string, isStopwatchMode?: boolean) => {
   if (!username) return;
   const timerRef = ref(database, `users/${username}/active_timer`);
-  await runTransaction(timerRef, (currentData) => {
+  const txResult = await runTransaction(timerRef, (currentData) => {
+    const now = getServerTime();
     if (!currentData) {
       return {
-        status: "BREAK",
-        mode: "POMODORO",
-        isStopwatchMode: false,
+        status: "PAUSED",
+        mode: isStopwatchMode ? "STOPWATCH" : "POMODORO",
+        isStopwatchMode: !!isStopwatchMode,
         startTimeMs: 0,
         accumulatedFocusMs: 0,
         taskTitle: "",
         tag: "",
-        lastUpdatedTimestamp: Date.now()
+        lastUpdatedTimestamp: now
       };
     }
-    const now = Date.now();
     let additional = 0;
     if (currentData.status === "FOCUSING" && currentData.startTimeMs) {
       additional = now - currentData.startTimeMs;
     }
     return {
       ...currentData,
-      status: "BREAK",
+      status: "PAUSED",
+      mode: currentData.mode || (isStopwatchMode ? "STOPWATCH" : "POMODORO"),
+      isStopwatchMode: currentData.isStopwatchMode !== undefined ? currentData.isStopwatchMode : !!isStopwatchMode,
       startTimeMs: 0,
       accumulatedFocusMs: (currentData.accumulatedFocusMs || 0) + additional,
       lastUpdatedTimestamp: now
     };
   });
+  if (txResult.committed && txResult.snapshot.exists()) {
+    await syncUserRootFromTimer(username, txResult.snapshot.val());
+  }
 };
 
-export const endWebSession = async (username: string) => {
+export const endWebSession = async (username: string, isStopwatchMode?: boolean) => {
   if (!username) return { status: "RELAXING" };
   const timerRef = ref(database, `users/${username}/active_timer`);
-  await runTransaction(timerRef, (currentData) => {
-    const now = Date.now();
+  const txResult = await runTransaction(timerRef, (currentData) => {
+    const now = getServerTime();
     const tzOffset = -new Date().getTimezoneOffset();
     
     let focusMs = 0;
@@ -730,10 +842,11 @@ export const endWebSession = async (username: string) => {
       }
     }
     
+    const finalIsStopwatch = currentData ? !!currentData.isStopwatchMode : !!isStopwatchMode;
     return {
       status: "RELAXING",
-      mode: currentData?.mode || "POMODORO",
-      isStopwatchMode: !!currentData?.isStopwatchMode,
+      mode: finalIsStopwatch ? "STOPWATCH" : "POMODORO",
+      isStopwatchMode: finalIsStopwatch,
       startTimeMs: 0,
       accumulatedFocusMs: focusMs,
       accumulatedBreakMs: breakMs,
@@ -743,6 +856,9 @@ export const endWebSession = async (username: string) => {
       lastUpdatedTimestamp: now
     };
   });
+  if (txResult.committed && txResult.snapshot.exists()) {
+    await syncUserRootFromTimer(username, txResult.snapshot.val());
+  }
   return { status: "RELAXING" };
 };
 
@@ -905,7 +1021,8 @@ export const addFocusRecordToDb = async (username: string, record: FocusRecord) 
     timestamp: Number(record.timestamp) || Date.now(),
     totalFocusTimeMs: (Number(record.durationSeconds) || 0) * 1000,
     totalBreakTimeMs: 0,
-    timezoneOffsetMinutes: tzOffset
+    timezoneOffsetMinutes: tzOffset,
+    mode: record.mode || "POMODORO"
   };
   await set(ref(database, path), dbRecord).catch(err => {
     console.error("Error writing focus record to history_logs:", err);
